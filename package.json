@@ -1,0 +1,18 @@
+{
+  "name": "meu-ninho-financas",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "set NEXT_DIST_DIR=.next-dev&& next dev --hostname 127.0.0.1 --port 3000",
+    "build": "next build",
+    "start": "set NEXT_DIST_DIR=.next-dev&& next dev --hostname 127.0.0.1 --port 3000",
+    "start:prod": "next start --hostname 127.0.0.1 --port 3000"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.108.2",
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
