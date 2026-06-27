@@ -18,6 +18,7 @@ const localDateKey = () => {
 const dateLabel = (value = new Date()) => new Intl.DateTimeFormat("pt-BR").format(value instanceof Date ? value : new Date(value));
 const transactionTimestamp = (transaction) => Number(transaction.createdAt || transaction.id) || 0;
 const forecastIsConfirmed = (forecast) => forecast.actualConfirmed ?? Boolean(forecast.transactionId);
+const forecastIsAutomaticFixed = (forecast) => forecast.type === "expense" && forecast.recurrence === "fixed";
 const HISTORY_RESET_VERSION = "2026-06-22-limpeza-completa-v3";
 const alertIsDue = (alert) => alert.active && (!alert.activationDate || alert.activationDate <= localDateKey());
 const formatPhone = (value) => {
@@ -196,7 +197,6 @@ export default function Home() {
         const {error:createError}=await supabase.from("finance_app_state").upsert({
           id:"couple",
           data,
-          owner_id:session.user.id,
           updated_by:session.user.id,
           updated_at:new Date().toISOString()
         });
@@ -214,7 +214,6 @@ export default function Home() {
       const {error}=await supabase.from("finance_app_state").upsert({
         id:"couple",
         data,
-        owner_id:session.user.id,
         updated_by:session.user.id,
         updated_at:new Date().toISOString()
       });
@@ -245,10 +244,12 @@ export default function Home() {
     if(user.cards.find(card=>card.id===transaction.cardId)?.cardType==="food") return false;
     if(!transaction.linkedForecastId) return true;
     const forecast=(user.forecasts||[]).find(item=>item.id===transaction.linkedForecastId);
+    if(forecastIsAutomaticFixed(forecast))return false;
     return Boolean(forecast && forecastIsConfirmed(forecast) && forecast.transactionId===transaction.id);
   });
+  const automaticFixedExpenses = financialMonthForecasts.filter(forecastIsAutomaticFixed).reduce((sum,forecast)=>sum+forecast.planned,0);
   const realizedIncome = financialMonthTransactions.filter(t => t.type === "income" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0);
-  const realizedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0);
+  const realizedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + automaticFixedExpenses;
   const plannedIncome = financialMonthForecasts.filter(f => f.type === "income").reduce((s, f) => s + f.planned, 0);
   const plannedExpenses = financialMonthForecasts.filter(f => f.type === "expense").reduce((s, f) => s + f.planned, 0);
   const plan = { income: plannedIncome, expenses: plannedExpenses };
@@ -362,14 +363,14 @@ function LoginScreen() {
   return <main className="login-page">
     <section className="login-card">
       <div className="login-brand"><span><PiggyBank size={27}/></span><div><b>Finanças</b><small>Rebeca & Gustavo</small></div></div>
-      <div className="login-copy"><span>ESPAÇO DO CASAL</span><h1>Entre para organizar a vida financeira de vocês.</h1><p>Um único acesso protegido. Depois do login, escolha entre as contas de Rebeca e Gustavo.</p></div>
+      <div className="login-copy"><span>ESPAÇO DO CASAL</span><h1>Entre para organizar a vida financeira de vocês.</h1><p>Um espaço compartilhado e protegido. Depois do login, escolha entre as contas de Rebeca e Gustavo.</p></div>
       <form onSubmit={submit}>
         <label>E-mail<input required type="email" value={email} onChange={event=>setEmail(event.target.value)} autoComplete="email" placeholder="seu@email.com"/></label>
         <label>Senha<input required type="password" value={password} onChange={event=>setPassword(event.target.value)} autoComplete="current-password" placeholder="Sua senha"/></label>
         {error&&<div className="login-error">{error}</div>}
         <button className="primary" disabled={loading}><LockKeyhole size={17}/>{loading?"Entrando...":"Entrar no Finanças"}</button>
       </form>
-      <small className="login-note">O cadastro de novos usuários fica desativado. Use o acesso único do casal.</small>
+      <small className="login-note">O acesso é permitido a qualquer usuário cadastrado no Supabase Auth.</small>
     </section>
   </main>;
 }
@@ -413,6 +414,11 @@ function FormSelect({ name, options, defaultValue, value, onChange, ariaLabel, c
 function Dashboard({ data, user, balance, realizedIncome, realizedExpenses, planDiff, savingsPercent, setModal, setPage }) {
   const chartMax = Math.max(user.plan.expenses, realizedExpenses, 1);
   const monthSavings = (data.savings.movements||[]).filter(m=>m.month===data.month&&m.type==="entry").reduce((sum,m)=>sum+m.amount,0);
+  const remainingGoal = Math.max((data.savings.goal||0)-data.savings.balance,0);
+  const monthContributions = ["Rebeca","Gustavo"].map(person=>({person,amount:(data.savings.movements||[]).filter(m=>m.month===data.month&&m.type==="entry"&&(m.person===person||m.owner===person)).reduce((sum,m)=>sum+m.amount,0)}));
+  const fixedCategoryExpenses=(user.forecasts||[])
+    .filter(f=>f.month===data.month&&forecastIsAutomaticFixed(f)&&user.cards.find(card=>card.id===f.cardId)?.cardType!=="food")
+    .map(f=>({category:f.category,amount:f.planned}));
   return <>
     <div className="page-title dashboard-welcome"><div><h1>Olá, {data.activeUser}! 👋</h1><p>Aqui está o resumo de {data.month.toLowerCase()}.</p></div>
       <button className="primary" onClick={() => setModal("transaction")}><Plus size={18} /> Novo lançamento</button>
@@ -446,12 +452,14 @@ function Dashboard({ data, user, balance, realizedIncome, realizedExpenses, plan
         <div className="panel savings-card">
           <div className="panel-head"><div><span>NOSSO COFRINHO</span></div><PiggyBank className="dashboard-pig" /></div>
           <div className="saving-ring" style={{ "--percent": `${savingsPercent * 3.6}deg` }}><span>{money(data.savings.balance)}<small>{savingsPercent}% da meta</small></span></div>
+          <div className="saving-goal-remaining"><span>Falta para a meta</span><b>{money(remainingGoal)}</b></div>
           <div className="month-saving-total"><span>Guardado em {data.month}</span><b>{money(monthSavings)}</b></div>
+          <div className="month-contributions">{monthContributions.map(item=><span key={item.person}><small>{item.person}</small><b>{money(item.amount)}</b></span>)}</div>
           <button className="secondary full" onClick={() => setModal("saving")}><Plus size={17} /> Adicionar ao cofrinho</button>
         </div>
         <div className="panel categories">
           <div className="panel-head"><div><span>POR CATEGORIA</span><h2>Para onde foi seu dinheiro</h2></div><CircleDollarSign size={19}/></div>
-          <CategoryPie transactions={user.transactions} />
+          <CategoryPie transactions={user.transactions} fixedExpenses={fixedCategoryExpenses}/>
         </div>
       </div>
       <div className="panel dashboard-cards">
@@ -471,14 +479,15 @@ function TransactionList({ items, onDelete, onAlert }) {
   return <div className="transaction-list">{items.map(t => <div className={`transaction ${onDelete || onAlert ? "deletable" : ""}`} key={t.id}><div className={`tx-icon ${t.type}`} >{t.type === "income" ? <ArrowUpRight /> : <ArrowDownLeft />}</div><div className="tx-name"><b>{t.title}</b><span>{t.category}{t.person && ` • ${t.person}`}{t.card && ` • ${t.card}`}{t.cardPaymentStatus==="Pendente"&&" • Pagamento pendente"}{t.installment && ` • Parcela ${t.installment}`}{t.fixed && " • Fixa"}</span></div><span className="tx-date">{t.date}</span><b className={t.type}>{t.type === "income" ? "+" : "−"} {money(t.amount)}</b>{onAlert && <button className="alert-transaction-button" aria-label={`Criar alerta para ${t.title}`} title="Criar alerta" onClick={() => onAlert(t)}><Bell size={15}/></button>}{onDelete && <button className="delete-button" aria-label={`Excluir ${t.title}`} onClick={() => onDelete(t)}><Trash2 size={16}/></button>}</div>)}</div>;
 }
 
-function CategoryPie({ transactions }) {
+function CategoryPie({ transactions, fixedExpenses=[] }) {
   const [hovered,setHovered]=useState(null);
   const colors = ["#e67c5b", "#d9a441", "#4d9a82", "#7485c1", "#ad719f", "#5e9eb0", "#b98455"];
   const grouped = useMemo(() => {
     const map = {};
     transactions.filter(t => t.type === "expense" && t.status === "Realizado").forEach(t => map[t.category] = (map[t.category] || 0) + t.amount);
+    fixedExpenses.forEach(item=>map[item.category]=(map[item.category]||0)+item.amount);
     return Object.entries(map).sort((a,b) => b[1] - a[1]);
-  }, [transactions]);
+  }, [transactions,fixedExpenses]);
   if (!grouped.length) return <div className="empty-state compact"><CircleDollarSign size={24}/><b>Sem categorias utilizadas</b><span>As categorias surgirão conforme seus gastos.</span></div>;
   const total=grouped.reduce((sum,[,amount])=>sum+amount,0);
   let angle=-90;
@@ -497,7 +506,7 @@ function CategoryPie({ transactions }) {
       </svg>
       <div className="pie-summary">{active?<><b>{active.name}</b><strong>{money(active.amount)}</strong><small>{active.percent.toFixed(1)}% do total</small></>:<><b>Total gasto</b><strong>{money(total)}</strong><small>Passe o mouse nas fatias</small></>}</div>
     </div>
-    <div className="category-legend">{slices.slice(0,7).map(slice=><button key={slice.name} onMouseEnter={()=>setHovered(slice.index)} onMouseLeave={()=>setHovered(null)} className={hovered===slice.index?"active":""}><i style={{background:colors[slice.index%colors.length]}}/><span>{slice.name}</span><b>{slice.percent.toFixed(0)}%</b></button>)}</div>
+    <div className="category-legend">{slices.slice(0,7).map(slice=><button key={slice.name} onMouseEnter={()=>setHovered(slice.index)} onMouseLeave={()=>setHovered(null)} className={hovered===slice.index?"active":""}><i style={{background:colors[slice.index%colors.length]}}/><span>{slice.name}</span><b>{money(slice.amount)} <small>{slice.percent.toFixed(0)}%</small></b></button>)}</div>
   </div>;
 }
 
@@ -518,7 +527,7 @@ function Planning({ data, setData, user, setModal, month }) {
   const plannedIncome = financialForecasts.filter(f => f.type === "income").reduce((s,f)=>s+f.planned,0);
   const plannedExpenses = financialForecasts.filter(f => f.type === "expense").reduce((s,f)=>s+f.planned,0);
   const actualIncome = financialForecasts.filter(f => f.type === "income" && forecastIsConfirmed(f)).reduce((s,f)=>s+(f.actual || 0),0) + unplanned.filter(t=>t.type==="income"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
-  const actualExpenses = financialForecasts.filter(f => f.type === "expense" && forecastIsConfirmed(f)).reduce((s,f)=>s+(f.actual || 0),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
+  const actualExpenses = financialForecasts.filter(f => f.type === "expense" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
   const plannedTotal = plannedIncome - plannedExpenses;
   const actualTotal = actualIncome - actualExpenses;
   const difference = actualTotal - plannedTotal;
@@ -531,6 +540,18 @@ function Planning({ data, setData, user, setModal, month }) {
       if (forecastIsConfirmed(forecast)) return d;
       const nextForecasts = account.forecasts.map(f => f.id === forecast.id ? {...f, actual, actualConfirmed:false, transactionId:null} : f);
       return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts:nextForecasts}}};
+    });
+  };
+
+  const updateFixedPlanned = (forecast, raw) => {
+    const planned=Math.max(Number(raw)||0,0);
+    setData(d=>{
+      const account=d.users[d.activeUser];
+      const forecasts=account.forecasts.map(item=>{
+        const sameSeries=forecast.seriesId?item.seriesId===forecast.seriesId:item.id===forecast.id;
+        return sameSeries&&forecastIsAutomaticFixed(item)?{...item,planned}:item;
+      });
+      return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts}}};
     });
   };
 
@@ -581,8 +602,8 @@ function Planning({ data, setData, user, setModal, month }) {
       <div className={difference >= 0 ? "positive" : "negative"}><span>DIFERENÇA</span><strong>{difference >= 0 ? "+" : "−"} {money(Math.abs(difference))}</strong><small>{difference >= 0 ? "resultado positivo" : "resultado negativo"}</small></div>
     </section>
     <div className="planning-groups">
-      <PlanningGroup title="Planejamento de Receitas" eyebrow="ENTRADAS PREVISTAS" type="income" items={monthForecasts.filter(f=>f.type==="income")} people={user.people} cards={user.cards} {...{updateActual,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
-      <PlanningGroup title="Planejamento de Despesas" eyebrow="SAÍDAS PREVISTAS" type="expense" items={monthForecasts.filter(f=>f.type==="expense")} people={user.people} cards={user.cards} {...{updateActual,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
+      <PlanningGroup title="Planejamento de Receitas" eyebrow="ENTRADAS PREVISTAS" type="income" total={plannedIncome} items={monthForecasts.filter(f=>f.type==="income")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
+      <PlanningGroup title="Planejamento de Despesas" eyebrow="SAÍDAS PREVISTAS" type="expense" total={plannedExpenses} items={monthForecasts.filter(f=>f.type==="expense")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
     </div>
     <section className="unplanned-section">
       <div className="unplanned-head"><div><span>FORA DO PLANEJADO</span><h2>Movimentações não previstas</h2></div><b>{money(unplanned.filter(t=>t.status==="Realizado").reduce((sum,t)=>sum+(t.type==="income"?t.amount:-t.amount),0))}</b></div>
@@ -591,16 +612,16 @@ function Planning({ data, setData, user, setModal, month }) {
   </>;
 }
 
-function PlanningGroup({title,eyebrow,type,items,people,cards,updateActual,confirmActual,reopenActual,removeForecast,reorderForecast}){
+function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}){
   const [search,setSearch]=useState(""),[person,setPerson]=useState(""),[card,setCard]=useState(""),[status,setStatus]=useState(""),[page,setPage]=useState(1);
   const filtered=items.filter(f=>(!search||f.description.toLowerCase().includes(search.toLowerCase()))
     &&(!person||String(f.personId||"")===person)
     &&(!card||(card==="none"?!f.cardId:String(f.cardId||"")===card))
-    &&(!status||(forecastIsConfirmed(f)?"Realizado":"Pendente")===status));
+    &&(!status||((forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))?"Realizado":"Pendente")===status));
   const pages=Math.max(1,Math.ceil(filtered.length/6)),current=Math.min(page,pages),visible=filtered.slice((current-1)*6,current*6);
   useEffect(()=>setPage(1),[search,person,card,status]);
   return <section className={`planning-group ${type}`}>
-    <div className="planning-group-head"><div><span>{eyebrow}</span><h2>{title}</h2><small>{filtered.length} {filtered.length===1?"previsão":"previsões"}</small></div><i className={`type-pill ${type}`}>{type==="income"?"Receitas":"Despesas"}</i></div>
+    <div className="planning-group-head"><div><span>{eyebrow}</span><h2>{title}</h2><small>{filtered.length} {filtered.length===1?"previsão":"previsões"}</small></div><div className="planning-group-total"><small>Total previsto</small><b>{money(total)}</b><i className={`type-pill ${type}`}>{type==="income"?"Receitas":"Despesas"}</i></div></div>
     <div className="planning-group-filters">
       <label className="filter-search"><Search size={15}/><input aria-label={`Pesquisar em ${title}`} value={search} onChange={e=>setSearch(e.target.value)} placeholder="Pesquisar previsão..."/></label>
       <CustomSelect ariaLabel={`Pessoa em ${title}`} value={person} onChange={setPerson} options={[{value:"",label:"Todas as pessoas"},...people.map(p=>({value:String(p.id),label:p.name}))]}/>
@@ -609,14 +630,14 @@ function PlanningGroup({title,eyebrow,type,items,people,cards,updateActual,confi
     </div>
     <div className="panel planning-sheet"><div className="sheet-scroll">
       <div className="sheet-row sheet-head"><span></span><span>Descrição</span><span>Categoria / Pessoa</span><span>Previsto</span><span>Realizado</span><span>Diferença</span><span>Situação</span><span></span></div>
-      {visible.map(f=>{const rowDiff=f.type==="expense"?f.planned-(f.actual||0):(f.actual||0)-f.planned,confirmed=forecastIsConfirmed(f);return <div className="sheet-row draggable-row" draggable onDragStart={e=>{e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",String(f.id));}} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();reorderForecast(Number(e.dataTransfer.getData("text/plain")),f.id);}} key={f.id}>
+      {visible.map(f=>{const automatic=forecastIsAutomaticFixed(f),effectiveActual=automatic?f.planned:(f.actual||0),rowDiff=f.type==="expense"?f.planned-effectiveActual:effectiveActual-f.planned,confirmed=automatic||forecastIsConfirmed(f);return <div className={`sheet-row draggable-row ${automatic?"automatic-fixed-row":""}`} draggable onDragStart={e=>{e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",String(f.id));}} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();reorderForecast(Number(e.dataTransfer.getData("text/plain")),f.id);}} key={f.id}>
         <span className="drag-handle" title="Arraste para reorganizar"><GripVertical size={17}/></span>
         <span className="sheet-description"><b>{f.description}</b><small>{f.month}{f.installment?` • Parcela ${f.installment}`:f.recurrence==="fixed"?" • Fixo":""}</small></span>
         <span className="sheet-description"><b>{f.category}</b><small>{f.person}</small></span>
-        <strong>{money(f.planned)}</strong>
-        <label className={`actual-cell ${confirmed?"confirmed":""}`}><span>R$</span><input aria-label={`Realizado de ${f.description}`} disabled={confirmed} type="number" min="0" step="0.01" value={f.actual??""} placeholder="0,00" onChange={e=>updateActual(f,e.target.value)}/></label>
-        <strong className={f.actual==null?"muted-value":rowDiff>=0?"positive-value":"negative-value"}>{f.actual==null?"Aguardando":`${rowDiff>=0?"+":"−"} ${money(Math.abs(rowDiff))}`}</strong>
-        <span className="actual-status">{confirmed?<button className="completed" onClick={()=>reopenActual(f)}><Check size={14}/> Concluído</button>:f.actual!=null?<button className="confirm" onClick={()=>confirmActual(f)}><Check size={14}/> Confirmar</button>:<i>Aguardando</i>}</span>
+        {automatic?<label className="fixed-planned-cell"><span>R$</span><input aria-label={`Valor fixo de ${f.description}`} type="number" min="0" step="0.01" value={f.planned} onChange={e=>updateFixedPlanned(f,e.target.value)}/></label>:<strong>{money(f.planned)}</strong>}
+        {automatic?<span className="fixed-auto-cell"><Check size={14}/><b>{money(f.planned)}</b><small>Débito automático</small></span>:<label className={`actual-cell ${confirmed?"confirmed":""}`}><span>R$</span><input aria-label={`Realizado de ${f.description}`} disabled={confirmed} type="number" min="0" step="0.01" value={f.actual??""} placeholder="0,00" onChange={e=>updateActual(f,e.target.value)}/></label>}
+        <strong className={automatic?"muted-value":f.actual==null?"muted-value":rowDiff>=0?"positive-value":"negative-value"}>{automatic?"Sem variação":f.actual==null?"Aguardando":`${rowDiff>=0?"+":"−"} ${money(Math.abs(rowDiff))}`}</strong>
+        <span className="actual-status">{automatic?<span className="fixed-status"><Check size={14}/> Automático</span>:confirmed?<button className="completed" onClick={()=>reopenActual(f)}><Check size={14}/> Concluído</button>:f.actual!=null?<button className="confirm" onClick={()=>confirmActual(f)}><Check size={14}/> Confirmar</button>:<i>Aguardando</i>}</span>
         <button className="delete-button" aria-label={`Remover previsão ${f.description}`} onClick={()=>removeForecast(f)}><Trash2 size={16}/></button>
       </div>})}
       {!visible.length&&<div className="empty-state large"><Target size={27}/><b>Nenhuma previsão encontrada</b><span>Ajuste os filtros ou adicione uma nova previsão.</span></div>}
@@ -989,3 +1010,4 @@ function Modal({ type, onClose, data, setData, user }) {
     </form>
   </div></div>;
 }
+
