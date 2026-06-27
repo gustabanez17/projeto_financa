@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle, ArrowDownLeft, ArrowUpRight, Bell, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleDollarSign,
   CreditCard, GripVertical, House, LayoutDashboard, LockKeyhole, LogOut, Menu, MoreHorizontal, Palette, Phone, PiggyBank,
-  Check, ClipboardList, Edit3, ExternalLink, Eye, Link2, MessageCircle, Plus, ReceiptText, Search, Settings, Sparkles, Target, Trash2, TrendingDown,
-  TrendingUp, UserPlus, UserRound, Users, WalletCards, X
+  Check, ClipboardList, Edit3, ExternalLink, Eye, Link2, MessageCircle, Plus, ReceiptText, Search, Settings, Sparkles, Target, Trash2,
+  UserPlus, UserRound, Users, WalletCards, X
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "../lib/supabase";
 
@@ -426,7 +426,6 @@ function Dashboard({ data, user, balance, realizedIncome, realizedExpenses, plan
     <section className="stat-grid">
       <Stat label="Receitas" value={money(realizedIncome)} note={`de ${money(user.plan.income)} previstos`} icon={ArrowUpRight} tone="blue" />
       <Stat label="Despesas" value={money(realizedExpenses)} note={`de ${money(user.plan.expenses)} previstos`} icon={ArrowDownLeft} tone="coral" />
-      <Stat label="Economia prevista" value={money(Math.max(planDiff, 0))} note={planDiff >= 0 ? "Você está abaixo do limite" : "Acima do que foi planejado"} icon={planDiff >= 0 ? TrendingUp : TrendingDown} tone="gold" />
     </section>
     <section className="dashboard-grid">
       <div className="dashboard-column dashboard-main-column">
@@ -530,7 +529,7 @@ function Planning({ data, setData, user, setModal, month }) {
   const actualExpenses = financialForecasts.filter(f => f.type === "expense" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
   const plannedTotal = plannedIncome - plannedExpenses;
   const actualTotal = actualIncome - actualExpenses;
-  const difference = actualTotal - plannedTotal;
+  const leftover = actualIncome - actualExpenses;
 
   const updateActual = (forecast, raw) => {
     const empty = raw === "";
@@ -599,7 +598,7 @@ function Planning({ data, setData, user, setModal, month }) {
       <div className="vertical-rule" />
       <div><span>SALDO REALIZADO</span><strong>{money(actualTotal)}</strong><small>somente valores concluídos</small></div>
       <div className="vertical-rule" />
-      <div className={difference >= 0 ? "positive" : "negative"}><span>DIFERENÇA</span><strong>{difference >= 0 ? "+" : "−"} {money(Math.abs(difference))}</strong><small>{difference >= 0 ? "resultado positivo" : "resultado negativo"}</small></div>
+      <div className={leftover >= 0 ? "positive" : "negative"}><span>SOBROU</span><strong>{leftover < 0 ? "− " : ""}{money(Math.abs(leftover))}</strong><small>{leftover >= 0 ? "receitas menos despesas do mês" : "despesas acima das receitas"}</small></div>
     </section>
     <div className="planning-groups">
       <PlanningGroup title="Planejamento de Receitas" eyebrow="ENTRADAS PREVISTAS" type="income" total={plannedIncome} items={monthForecasts.filter(f=>f.type==="income")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
