@@ -2,11 +2,13 @@ create table if not exists public.finance_app_state (
   id text primary key default 'couple',
   data jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now(),
-  owner_id uuid not null references auth.users(id),
+  owner_id uuid references auth.users(id),
   updated_by uuid references auth.users(id)
 );
 
 alter table public.finance_app_state enable row level security;
+alter table public.finance_app_state alter column owner_id drop not null;
+grant select, insert, update on public.finance_app_state to authenticated;
 
 do $$
 begin
@@ -20,7 +22,7 @@ create policy "authenticated couple can read state"
 on public.finance_app_state
 for select
 to authenticated
-using (id = 'couple' and owner_id = (select auth.uid()));
+using (id = 'couple');
 
 drop policy if exists "authenticated couple can create state" on public.finance_app_state;
 create policy "authenticated couple can create state"
@@ -29,7 +31,6 @@ for insert
 to authenticated
 with check (
   id = 'couple'
-  and owner_id = (select auth.uid())
   and updated_by = (select auth.uid())
 );
 
@@ -38,9 +39,9 @@ create policy "authenticated couple can update state"
 on public.finance_app_state
 for update
 to authenticated
-using (id = 'couple' and owner_id = (select auth.uid()))
+using (id = 'couple')
 with check (
   id = 'couple'
-  and owner_id = (select auth.uid())
   and updated_by = (select auth.uid())
 );
+
