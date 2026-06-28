@@ -5,7 +5,7 @@ import {
   AlertTriangle, ArrowDownLeft, ArrowUpRight, Bell, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleDollarSign,
   CreditCard, Grid2X2, GripVertical, House, LayoutDashboard, LockKeyhole, LogOut, Menu, MoreHorizontal, Palette, Phone, PiggyBank,
   Check, ClipboardList, Edit3, ExternalLink, Eye, Link2, MessageCircle, Plus, ReceiptText, Search, Settings, Sparkles, Target, Trash2,
-  UserPlus, UserRound, Users, WalletCards, X
+  Trophy, UserPlus, UserRound, Users, WalletCards, X
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "../lib/supabase";
 
@@ -50,7 +50,7 @@ const initialData = {
   month: "Junho",
   homeGroups: [],
   sharedQuotes: [],
-  savings: { balance: 0, goal: 0, goalType: "annual", goalMonths: 12, goals: [], activeGoalId: null, movements: [], contributions: { Rebeca: 0, Gustavo: 0 } },
+  savings: { balance: 0, goal: 0, goalType: "annual", goalMonths: 12, goals: [], completedGoals: [], activeGoalId: null, movements: [], contributions: { Rebeca: 0, Gustavo: 0 } },
   users: {
     Rebeca: {
       plan: { income: 0, expenses: 0 },
@@ -186,6 +186,7 @@ export default function Home() {
           goalType:"annual",
           goalMonths:12,
           goals:[],
+          completedGoals:[],
           activeGoalId:null,
           movements:[],
           contributions:{Rebeca:0,Gustavo:0}
@@ -198,6 +199,7 @@ export default function Home() {
       parsed.savings.goalMonths ||= 12;
       parsed.savings.movements ||= [];
       parsed.savings.goals ||= parsed.savings.goal > 0 ? [{id:Date.now(),name:"Meta principal",amount:parsed.savings.goal,type:parsed.savings.goalType,months:parsed.savings.goalMonths}] : [];
+      parsed.savings.completedGoals ||= [];
       parsed.savings.activeGoalId ||= parsed.savings.goals[0]?.id || null;
       dataRef.current = parsed;
       setStoredData(parsed);
@@ -905,6 +907,7 @@ function Savings({ data, setData, setModal }) {
   const [statementMode,setStatementMode]=useState("total");
   const [statementMonth,setStatementMonth]=useState(data.month);
   const goals = data.savings.goals || [];
+  const completedGoals = [...(data.savings.completedGoals || [])].sort((a,b)=>(b.completedAt||0)-(a.completedAt||0));
   const activeGoal = goals.find(g=>g.id===data.savings.activeGoalId) || goals[0] || null;
   const percent = data.savings.goal > 0 ? Math.min(Math.round(data.savings.balance/data.savings.goal*100), 100) : 0;
   const activeGoalMonthCount = activeGoal?.selectedMonths?.length || activeGoal?.months || 12;
@@ -925,6 +928,17 @@ function Savings({ data, setData, setModal }) {
     const goal=d.savings.goals.find(g=>g.id===+id);
     return goal?{...d,savings:{...d.savings,activeGoalId:goal.id,goal:goal.amount,goalType:goal.type,goalMonths:goal.selectedMonths?.length || goal.months}}:d;
   });
+  const completeGoal = () => {
+    if(!activeGoal || data.savings.balance < activeGoal.amount)return;
+    const completedAt=Date.now(),completedDate=dateLabel();
+    setData(d=>{
+      const goal=(d.savings.goals||[]).find(item=>item.id===activeGoal.id);
+      if(!goal || d.savings.balance<goal.amount)return d;
+      const remainingGoals=(d.savings.goals||[]).filter(item=>item.id!==goal.id),nextGoal=remainingGoals[0]||null;
+      const achievement={...goal,completedAt,completedDate,completedMonth:d.month,completedBy:d.activeUser,achievedAmount:d.savings.balance};
+      return {...d,savings:{...d.savings,goals:remainingGoals,completedGoals:[achievement,...(d.savings.completedGoals||[])],activeGoalId:nextGoal?.id||null,goal:nextGoal?.amount||0,goalType:nextGoal?.type||"annual",goalMonths:nextGoal?.selectedMonths?.length||nextGoal?.months||12}};
+    });
+  };
   const removeMovement = (movement) => setData(d => {
     const balance = movement.type === "entry" ? Math.max(0,d.savings.balance-movement.amount) : d.savings.balance+movement.amount;
     const contributions = movement.type === "entry" && d.savings.contributions[movement.person] !== undefined ? {...d.savings.contributions,[movement.person]:Math.max(0,d.savings.contributions[movement.person]-movement.amount)} : d.savings.contributions;
@@ -949,12 +963,20 @@ function Savings({ data, setData, setModal }) {
     <section className="savings-content-grid">
       <div className="panel goal-settings">
         <div className="panel-head"><div><span>META ATIVA</span><h2>Objetivo do casal</h2></div>{goals.length>1&&<label className="goal-selector"><select aria-label="Meta ativa" value={activeGoal?.id || ""} onChange={e=>selectGoal(e.target.value)}>{goals.map(g=><option value={g.id} key={g.id}>{g.name}</option>)}</select><ChevronDown size={14}/></label>}</div>
-        {activeGoal?<div className="saved-goal"><div className="saved-goal-icon">{activeGoal.type==="annual"?<Target/>:<CalendarDays/>}</div><div><span>{activeGoal.type==="annual"?"META ANUAL":`META EM ${activeGoalMonthCount} MESES`}</span><h3>{activeGoal.name}</h3><strong>{money(activeGoal.amount)}</strong>{activeGoal.type==="monthly"&&activeGoal.selectedMonths?.length>0&&<div className="saved-goal-months">{activeGoal.selectedMonths.map(m=><i key={m}>{m.slice(0,3)}</i>)}</div>}<p>Valor necessário por mês: <b>{money(monthlyTarget)}</b></p></div><i><Sparkles size={15}/> Meta salva</i></div>:<div className="empty-goal"><Target size={27}/><b>Nenhuma meta definida</b><span>Clique em “Definir meta” para criar o primeiro objetivo do casal.</span><button className="secondary" onClick={()=>setModal("savings-goal")}>Definir meta</button></div>}
+        {activeGoal?<div className="saved-goal"><div className="saved-goal-icon">{activeGoal.type==="annual"?<Target/>:<CalendarDays/>}</div><div><span>{activeGoal.type==="annual"?"META ANUAL":`META EM ${activeGoalMonthCount} MESES`}</span><h3>{activeGoal.name}</h3><strong>{money(activeGoal.amount)}</strong>{activeGoal.type==="monthly"&&activeGoal.selectedMonths?.length>0&&<div className="saved-goal-months">{activeGoal.selectedMonths.map(m=><i key={m}>{m.slice(0,3)}</i>)}</div>}<p>Valor necessário por mês: <b>{money(monthlyTarget)}</b></p></div><div className="saved-goal-actions"><i><Sparkles size={15}/> Meta salva</i><button className="complete-goal-button" type="button" disabled={data.savings.balance<activeGoal.amount} onClick={completeGoal}><Trophy size={16}/>{data.savings.balance>=activeGoal.amount?"Concluir meta":`Faltam ${money(activeGoal.amount-data.savings.balance)}`}</button></div></div>:<div className="empty-goal"><Target size={27}/><b>Nenhuma meta definida</b><span>Clique em “Definir meta” para criar o primeiro objetivo do casal.</span><button className="secondary" onClick={()=>setModal("savings-goal")}>Definir meta</button></div>}
       </div>
       <div className="panel quick-contribution">
         <div className="panel-head"><div><span>CONTRIBUIR</span><h2>Adicionar ao cofrinho</h2></div></div>
         <form className="saving-form" onSubmit={add}><label>Valor da contribuição<div className="currency-input"><span>R$</span><input required name="amount" type="number" min="0.01" step="0.01" placeholder="0,00"/></div></label><p>Entrada registrada por <b>{data.activeUser}</b> em {data.month}.</p><button className="primary" type="submit">Guardar dinheiro</button></form>
       </div>
+    </section>
+    <section className="panel goal-trophy-history">
+      <div className="panel-head"><div><span>CONQUISTAS DO CASAL</span><h2>Histórico de metas</h2></div><div className="trophy-history-count"><Trophy size={17}/><b>{completedGoals.length}</b></div></div>
+      {completedGoals.length?<div className="trophy-grid">{completedGoals.map((goal,index)=><article className="goal-trophy-card" key={`${goal.id}-${goal.completedAt}`}>
+        <div className="trophy-medal"><Trophy/><small>{String(completedGoals.length-index).padStart(2,"0")}</small></div>
+        <div className="trophy-copy"><span>META CONCLUÍDA</span><h3>{goal.name}</h3><strong>{money(goal.amount)}</strong><p>Conquistada em {goal.completedDate||"data não informada"} por <b>{goal.completedBy||"Rebeca e Gustavo"}</b>.</p></div>
+        <div className="trophy-result"><span>Saldo ao concluir</span><b>{money(goal.achievedAmount??goal.amount)}</b><small>{goal.type==="annual"?"Meta anual":`${goal.selectedMonths?.length||goal.months||1} meses`}</small></div>
+      </article>)}</div>:<div className="empty-trophy-history"><Trophy size={29}/><b>Os primeiros troféus ainda estão por vir</b><span>Quando uma meta atingir 100%, use “Concluir meta” para guardar essa conquista aqui.</span></div>}
     </section>
     <section className="panel savings-statement">
       <div className="panel-head savings-statement-head">
