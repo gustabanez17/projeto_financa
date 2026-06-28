@@ -939,6 +939,7 @@ function Savings({ data, setData, setModal }) {
       return {...d,savings:{...d.savings,goals:remainingGoals,completedGoals:[achievement,...(d.savings.completedGoals||[])],activeGoalId:nextGoal?.id||null,goal:nextGoal?.amount||0,goalType:nextGoal?.type||"annual",goalMonths:nextGoal?.selectedMonths?.length||nextGoal?.months||12}};
     });
   };
+  const removeCompletedGoal = (goal) => setData(d=>({...d,savings:{...d.savings,completedGoals:(d.savings.completedGoals||[]).filter(item=>!(item.id===goal.id&&item.completedAt===goal.completedAt))}}));
   const removeMovement = (movement) => setData(d => {
     const balance = movement.type === "entry" ? Math.max(0,d.savings.balance-movement.amount) : d.savings.balance+movement.amount;
     const contributions = movement.type === "entry" && d.savings.contributions[movement.person] !== undefined ? {...d.savings.contributions,[movement.person]:Math.max(0,d.savings.contributions[movement.person]-movement.amount)} : d.savings.contributions;
@@ -973,6 +974,7 @@ function Savings({ data, setData, setModal }) {
     <section className="panel goal-trophy-history">
       <div className="panel-head"><div><span>CONQUISTAS DO CASAL</span><h2>Histórico de metas</h2></div><div className="trophy-history-count"><Trophy size={17}/><b>{completedGoals.length}</b></div></div>
       {completedGoals.length?<div className="trophy-grid">{completedGoals.map((goal,index)=><article className="goal-trophy-card" key={`${goal.id}-${goal.completedAt}`}>
+        <button className="trophy-delete-button" type="button" aria-label={`Excluir meta concluída ${goal.name}`} title="Excluir meta concluída" onClick={()=>removeCompletedGoal(goal)}><Trash2 size={15}/></button>
         <div className="trophy-medal"><Trophy/><small>{String(completedGoals.length-index).padStart(2,"0")}</small></div>
         <div className="trophy-copy"><span>META CONCLUÍDA</span><h3>{goal.name}</h3><strong>{money(goal.amount)}</strong><p>Conquistada em {goal.completedDate||"data não informada"} por <b>{goal.completedBy||"Rebeca e Gustavo"}</b>.</p></div>
         <div className="trophy-result"><span>Saldo ao concluir</span><b>{money(goal.achievedAmount??goal.amount)}</b><small>{goal.type==="annual"?"Meta anual":`${goal.selectedMonths?.length||goal.months||1} meses`}</small></div>
