@@ -8,6 +8,7 @@ import {
   Trophy, UserPlus, UserRound, Users, WalletCards, X
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "../lib/supabase";
+import { applySyncPatches, collectSyncPatches } from "../lib/finance-sync.mjs";
 
 const money = (value) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value);
 const months = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
@@ -75,6 +76,44 @@ const initialData = {
   }
 };
 
+const LOCAL_DATA_KEY = "financas-v2";
+const LOCAL_SYNC_KEY = "financas-v2-sync-v2";
+const LOCAL_BACKUPS_KEY = "financas-v2-backups";
+const normalizeFinanceState = (raw={}) => ({
+  ...initialData,
+  ...raw,
+  historyResetVersion:HISTORY_RESET_VERSION,
+  homeGroups:raw.homeGroups||[],
+  sharedQuotes:raw.sharedQuotes||[],
+  savings:{...initialData.savings,...(raw.savings||{}),contributions:{...initialData.savings.contributions,...(raw.savings?.contributions||{})},goals:raw.savings?.goals||[],completedGoals:raw.savings?.completedGoals||[],movements:raw.savings?.movements||[]},
+  users:{
+    Rebeca:{...initialData.users.Rebeca,...(raw.users?.Rebeca||{})},
+    Gustavo:{...initialData.users.Gustavo,...(raw.users?.Gustavo||{})}
+  }
+});
+const stripSyncHistory = data => {const clean={...data};delete clean._sync;return clean;};
+const stateSummary = data => ({
+  Rebeca:{transactions:data.users?.Rebeca?.transactions?.length||0,forecasts:data.users?.Rebeca?.forecasts?.length||0},
+  Gustavo:{transactions:data.users?.Gustavo?.transactions?.length||0,forecasts:data.users?.Gustavo?.forecasts?.length||0},
+  savings:data.savings?.movements?.length||0
+});
+const persistLocalState = (data,patches) => {
+  if(typeof window==="undefined")return;
+  localStorage.setItem(LOCAL_DATA_KEY,JSON.stringify(stripSyncHistory(data)));
+  localStorage.setItem(LOCAL_SYNC_KEY,JSON.stringify({version:2,dirty:Object.keys(patches||{}).length>0,patches:patches||{},updatedAt:new Date().toISOString()}));
+};
+const createLocalBackup = (data,reason) => {
+  if(typeof window==="undefined"||!data?.users)return;
+  try {
+    const clean=stripSyncHistory(data),serialized=JSON.stringify(clean),stored=JSON.parse(localStorage.getItem(LOCAL_BACKUPS_KEY)||"[]");
+    if(stored[0]?.data&&JSON.stringify(stored[0].data)===serialized)return;
+    const next=[{id:Date.now(),createdAt:new Date().toISOString(),reason,summary:stateSummary(clean),data:clean},...stored].slice(0,4);
+    localStorage.setItem(LOCAL_BACKUPS_KEY,JSON.stringify(next));
+  } catch (_error) {
+    try {localStorage.removeItem(LOCAL_BACKUPS_KEY);} catch (_ignored) {}
+  }
+};
+
 const navItems = [
   ["Visão geral", LayoutDashboard],
   ["Planejamento", Target],
@@ -99,22 +138,32 @@ export default function Home() {
   const [authReady, setAuthReady] = useState(false);
   const [remoteLoaded, setRemoteLoaded] = useState(false);
   const [syncError, setSyncError] = useState("");
+  const [syncStatus, setSyncStatus] = useState("loading");
   const [syncTick, setSyncTick] = useState(0);
   const dataRef = useRef(initialData);
-  const pendingMutationsRef = useRef([]);
+  const pendingPatchesRef = useRef({});
+  const revisionRef = useRef(Date.now());
   const syncInFlightRef = useRef(false);
   const setData = useCallback((updater) => {
-    const mutation = typeof updater === "function" ? updater : () => updater;
-    pendingMutationsRef.current.push(mutation);
-    setStoredData(current => {
-      const next = mutation(current);
-      dataRef.current = next;
-      return next;
-    });
+    const current=dataRef.current;
+    const next=typeof updater==="function"?updater(current):updater;
+    if(!next||JSON.stringify(current)===JSON.stringify(next))return;
+    revisionRef.current+=1;
+    pendingPatchesRef.current=collectSyncPatches(current,next,pendingPatchesRef.current,revisionRef.current);
+    dataRef.current=next;
+    persistLocalState(next,pendingPatchesRef.current);
+    setStoredData(next);
+    setSyncStatus("pending");
+    setSyncError("");
+    setSyncTick(value=>value+1);
   }, []);
-  const applyRemoteData = useCallback((next) => {
-    dataRef.current = next;
-    setStoredData(current => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+  const applyRemoteData = useCallback((next,backupReason="remote") => {
+    const normalized=normalizeFinanceState(next);
+    const current=dataRef.current;
+    if(JSON.stringify(current)!==JSON.stringify(normalized))createLocalBackup(current,backupReason);
+    dataRef.current=normalized;
+    persistLocalState(normalized,pendingPatchesRef.current);
+    setStoredData(normalized);
   }, []);
 
   useEffect(() => {
@@ -130,9 +179,16 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const stored = localStorage.getItem("financas-v2");
+    const stored = localStorage.getItem(LOCAL_DATA_KEY);
+    try {
+      const syncState=JSON.parse(localStorage.getItem(LOCAL_SYNC_KEY)||"{}");
+      pendingPatchesRef.current=syncState.version===2&&syncState.patches?syncState.patches:{};
+      revisionRef.current=Math.max(Date.now(),...Object.values(pendingPatchesRef.current).map(entry=>entry.revision||0));
+    } catch (_error) {
+      pendingPatchesRef.current={};
+    }
     if (stored) {
-      const parsed = JSON.parse(stored);
+      const parsed = normalizeFinanceState(JSON.parse(stored));
       const fixedSidebarColor = localStorage.getItem("financas-sidebar-color");
       parsed.sidebarColor = fixedSidebarColor || parsed.sidebarColor || initialData.sidebarColor;
       if(!fixedSidebarColor)localStorage.setItem("financas-sidebar-color",parsed.sidebarColor);
@@ -169,32 +225,7 @@ export default function Home() {
         }));
         account.alertTemplate ||= defaultAlertTemplate;
       });
-      if(parsed.historyResetVersion !== HISTORY_RESET_VERSION){
-        Object.values(parsed.users).forEach(account => {
-          account.transactions = [];
-          account.forecasts = [];
-          account.cards = [];
-          account.people = [];
-          account.alerts = [];
-          account.quotes = [];
-          account.plan = {income:0,expenses:0};
-          account.alertTemplate = defaultAlertTemplate;
-        });
-        parsed.savings = {
-          balance:0,
-          goal:0,
-          goalType:"annual",
-          goalMonths:12,
-          goals:[],
-          completedGoals:[],
-          activeGoalId:null,
-          movements:[],
-          contributions:{Rebeca:0,Gustavo:0}
-        };
-        parsed.homeGroups = [];
-        parsed.sharedQuotes = [];
-        parsed.historyResetVersion = HISTORY_RESET_VERSION;
-      }
+      parsed.historyResetVersion = HISTORY_RESET_VERSION;
       parsed.savings.goalType ||= "annual";
       parsed.savings.goalMonths ||= 12;
       parsed.savings.movements ||= [];
@@ -202,6 +233,7 @@ export default function Home() {
       parsed.savings.completedGoals ||= [];
       parsed.savings.activeGoalId ||= parsed.savings.goals[0]?.id || null;
       dataRef.current = parsed;
+      persistLocalState(parsed,pendingPatchesRef.current);
       setStoredData(parsed);
     }
     setReady(true);
@@ -211,40 +243,53 @@ export default function Home() {
     let cancelled=false;
     const loadSharedState=async()=>{
       setSyncError("");
-      const {data:row,error}=await supabase.from("finance_app_state").select("data").eq("id","couple").maybeSingle();
+      setSyncStatus("loading");
+      const {data:row,error}=await supabase.from("finance_app_state").select("data,updated_at").eq("id","couple").maybeSingle();
       if(cancelled)return;
-      if(error){setSyncError("Não foi possível carregar os dados compartilhados.");setRemoteLoaded(true);return;}
-      if(row?.data)applyRemoteData(row.data);
+      if(error){setSyncError("Não foi possível carregar os dados compartilhados. A cópia local foi preservada.");setSyncStatus("error");setRemoteLoaded(true);return;}
+      if(row?.data){
+        const remote=normalizeFinanceState(row.data);
+        const recovered=Object.keys(pendingPatchesRef.current).length?applySyncPatches(remote,pendingPatchesRef.current):remote;
+        applyRemoteData(recovered,Object.keys(pendingPatchesRef.current).length?"reconciliação com o Supabase":"atualização recebida do Supabase");
+        setSyncStatus(Object.keys(pendingPatchesRef.current).length?"pending":"saved");
+      }
       else {
         const {error:createError}=await supabase.from("finance_app_state").upsert({
           id:"couple",
-          data,
+          data:dataRef.current,
           updated_by:session.user.id,
           updated_at:new Date().toISOString()
         });
-        if(createError){setSyncError("Não foi possível criar o espaço compartilhado.");setRemoteLoaded(true);return;}
+        if(createError){setSyncError("Não foi possível criar o espaço compartilhado. A cópia local foi preservada.");setSyncStatus("error");setRemoteLoaded(true);return;}
+        pendingPatchesRef.current={};
+        persistLocalState(dataRef.current,{});
+        setSyncStatus("saved");
       }
       setRemoteLoaded(true);
+      if(Object.keys(pendingPatchesRef.current).length)setSyncTick(value=>value+1);
     };
     loadSharedState();
     return ()=>{cancelled=true;};
   }, [ready,session?.user?.id,applyRemoteData]);
   useEffect(() => {
-    if(ready)localStorage.setItem("financas-v2",JSON.stringify(data));
-    if(!ready||!remoteLoaded||!session||!supabase||pendingMutationsRef.current.length===0)return;
+    if(!ready||!remoteLoaded||!session||!supabase||Object.keys(pendingPatchesRef.current).length===0)return;
     const timer=setTimeout(async()=>{
       if(syncInFlightRef.current)return;
       syncInFlightRef.current=true;
-      const mutations=pendingMutationsRef.current.splice(0);
+      setSyncStatus("syncing");
+      const patchesToSave={...pendingPatchesRef.current};
       try {
         let merged=null;
         let saved=false;
         for(let attempt=0;attempt<4&&!saved;attempt+=1){
           const {data:row,error:loadError}=await supabase.from("finance_app_state").select("data,updated_at").eq("id","couple").maybeSingle();
           if(loadError)throw loadError;
-          const base=row?.data||dataRef.current;
-          merged=mutations.reduce((current,mutation)=>mutation(current),base);
+          const base=normalizeFinanceState(row?.data||initialData);
+          merged=applySyncPatches(base,patchesToSave);
           const updatedAt=new Date().toISOString();
+          const previousSnapshot=row?.data?{createdAt:row.updated_at||updatedAt,summary:stateSummary(base),data:stripSyncHistory(base)}:null;
+          const priorBackups=Array.isArray(row?.data?._sync?.backups)?row.data._sync.backups:[];
+          merged={...merged,_sync:{revision:(row?.data?._sync?.revision||0)+1,updatedAt,updatedBy:session.user.id,backups:(previousSnapshot?[previousSnapshot,...priorBackups]:priorBackups).slice(0,3)}};
           if(!row){
             const {error}=await supabase.from("finance_app_state").upsert({id:"couple",data:merged,updated_by:session.user.id,updated_at:updatedAt});
             if(error)throw error;
@@ -261,26 +306,32 @@ export default function Home() {
           }
         }
         if(!saved)throw new Error("Conflito ao sincronizar alterações compartilhadas.");
+        Object.entries(patchesToSave).forEach(([path,savedPatch])=>{
+          if(pendingPatchesRef.current[path]?.revision===savedPatch.revision)delete pendingPatchesRef.current[path];
+        });
         setSyncError("");
-        const withNewerLocalChanges=pendingMutationsRef.current.reduce((current,mutation)=>mutation(current),merged);
-        applyRemoteData(withNewerLocalChanges);
+        const withNewerLocalChanges=applySyncPatches(merged,pendingPatchesRef.current);
+        applyRemoteData(withNewerLocalChanges,"confirmação de sincronização");
+        setSyncStatus(Object.keys(pendingPatchesRef.current).length?"pending":"saved");
       } catch (_error) {
-        pendingMutationsRef.current.unshift(...mutations);
-        setSyncError("Não foi possível sincronizar a última alteração.");
+        persistLocalState(dataRef.current,pendingPatchesRef.current);
+        setSyncStatus("error");
+        setSyncError("A última alteração ainda não chegou ao Supabase. Ela foi preservada neste dispositivo e será reenviada automaticamente.");
       } finally {
         syncInFlightRef.current=false;
-        if(pendingMutationsRef.current.length)setSyncTick(current=>current+1);
+        if(Object.keys(pendingPatchesRef.current).length)setSyncTick(current=>current+1);
       }
-    },500);
+    },400);
     return ()=>clearTimeout(timer);
-  }, [data,ready,remoteLoaded,session?.user?.id,syncTick,applyRemoteData]);
+  }, [ready,remoteLoaded,session?.user?.id,syncTick,applyRemoteData]);
   useEffect(() => {
     if(!remoteLoaded||!session||!supabase)return;
     const channel=supabase.channel("finance-couple-state")
       .on("postgres_changes",{event:"UPDATE",schema:"public",table:"finance_app_state",filter:"id=eq.couple"},payload=>{
         if(!payload.new?.data)return;
-        if(syncInFlightRef.current||pendingMutationsRef.current.length)return;
-        applyRemoteData(payload.new.data);
+        if(syncInFlightRef.current||Object.keys(pendingPatchesRef.current).length)return;
+        applyRemoteData(payload.new.data,"atualização em tempo real");
+        setSyncStatus("saved");
       })
       .subscribe();
     return ()=>{supabase.removeChannel(channel);};
@@ -370,6 +421,7 @@ export default function Home() {
             </div>
           </div>
           <div className="header-actions">
+            <div className={`sync-indicator ${syncStatus}`} title={syncStatus==="saved"?"Todos os dados estão salvos no Supabase":syncStatus==="error"?"Alterações preservadas localmente, aguardando sincronização":"Sincronizando dados"}>{syncStatus==="saved"?<Check size={13}/>:syncStatus==="error"?<AlertTriangle size={13}/>:<Sparkles size={13}/>}<span>{syncStatus==="saved"?"Salvo":syncStatus==="error"?"Pendente no dispositivo":"Sincronizando"}</span></div>
             <div className="notification-wrap">
               <button className="icon-button notification" aria-label="Abrir alertas de hoje" aria-expanded={alertsOpen} onClick={()=>setAlertsOpen(open=>!open)}><Bell size={19} />{activeAlerts > 0 && <i />}</button>
               {alertsOpen&&<div className="notification-popover">
@@ -394,7 +446,7 @@ export default function Home() {
           {page === "Cofrinho" && <Savings data={data} setData={setData} setModal={setModal} />}
           {page === "Cartões" && <Cards user={user} setModal={setModal} setData={setData} activeUser={data.activeUser} month={data.month} />}
           {page === "Nossa Casa" && <HomeChecklist data={data} setData={setData} setModal={setModal} />}
-          {page === "Configurações" && <SettingsPage data={data} update={update} navItems={navItems} />}
+          {page === "Configurações" && <SettingsPage data={data} update={update} setData={setData} navItems={navItems} />}
         </div>
       </main>
       {modal === "monthly-sheet" ? <MonthlySpreadsheetModal data={data} user={user} onClose={() => setModal(null)} /> : modal && <Modal type={modal} onClose={() => setModal(null)} data={data} setData={setData} user={user} />}
@@ -1013,9 +1065,21 @@ function Cards({ user, setModal, setData, activeUser, month }) {
 }
 const dataName = money;
 
-function SettingsPage({ data, update, navItems }) {
+function SettingsPage({ data, update, setData, navItems }) {
   const colors = ["#173f35","#243659","#603854","#6c3c2f","#393b42"];
   const order=data.navOrder?.length?data.navOrder:navItems.map(([label])=>label);
+  let localBackups=[];
+  try {localBackups=JSON.parse(localStorage.getItem(LOCAL_BACKUPS_KEY)||"[]");} catch (_error) {}
+  const backups=[...(data._sync?.backups||[]).map((backup,index)=>({...backup,id:`remote-${backup.createdAt}-${index}`,source:"Supabase"})),...localBackups.map(backup=>({...backup,source:"Dispositivo"}))]
+    .filter(backup=>backup.data)
+    .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))
+    .slice(0,6);
+  const restoreBackup=backup=>{
+    if(!window.confirm(`Restaurar a cópia de ${new Intl.DateTimeFormat("pt-BR",{dateStyle:"short",timeStyle:"short"}).format(new Date(backup.createdAt))}? O estado atual será preservado como uma nova cópia de segurança.`))return;
+    createLocalBackup(data,"antes de restaurar uma cópia");
+    const restored=normalizeFinanceState({...backup.data,activeUser:data.activeUser,month:data.month,theme:data.theme,sidebarColor:data.sidebarColor,navOrder:data.navOrder});
+    setData(()=>restored);
+  };
   const moveModule=(index,direction)=>{
     const target=index+direction;
     if(target<0||target>=order.length)return;
@@ -1029,6 +1093,11 @@ function SettingsPage({ data, update, navItems }) {
       <div className="panel setting-block"><Palette/><div><h2>Cor da barra lateral</h2><p>Esta escolha fica fixa nas próximas aberturas do site.</p><div className="color-picker">{colors.map(c=><button aria-label={`Cor ${c}`} className={data.sidebarColor===c?"selected":""} style={{background:c}} onClick={()=>{localStorage.setItem("financas-sidebar-color",c);update({sidebarColor:c});}} key={c}/>)}</div></div></div>
       <div className="panel module-order-setting"><div className="panel-head"><div><span>NAVEGAÇÃO</span><h2>Ordem dos módulos</h2></div><GripVertical/></div><p>Organize a barra lateral conforme sua rotina.</p><div className="module-order-list">{order.map((label,index)=>{const Icon=navItems.find(item=>item[0]===label)?.[1]||Menu;return <div key={label}><span><Icon size={16}/><b>{label}</b></span><i><button disabled={index===0} aria-label={`Subir ${label}`} onClick={()=>moveModule(index,-1)}><ChevronUp size={15}/></button><button disabled={index===order.length-1} aria-label={`Descer ${label}`} onClick={()=>moveModule(index,1)}><ChevronDown size={15}/></button></i></div>})}</div></div>
       <div className="panel privacy"><Users/><div><h2>Contas separadas, planos juntos</h2><p>As receitas, despesas e cartões de Rebeca e Gustavo nunca se misturam. Somente o saldo e as contribuições do Cofrinho são compartilhados.</p></div></div>
+      <div className="panel backup-setting">
+        <div className="panel-head"><div><span>PROTEÇÃO DE DADOS</span><h2>Cópias de segurança</h2></div><LockKeyhole size={20}/></div>
+        <p>O Finanças preserva versões anteriores antes de receber ou gravar alterações. Restaure uma cópia somente se algum dado desaparecer.</p>
+        {backups.length?<div className="backup-list">{backups.map(backup=><div className="backup-row" key={backup.id||backup.createdAt}><span><b>{new Intl.DateTimeFormat("pt-BR",{dateStyle:"short",timeStyle:"short"}).format(new Date(backup.createdAt))}</b><small>{backup.source} • Rebeca: {backup.summary?.Rebeca?.transactions||0} lançamentos / {backup.summary?.Rebeca?.forecasts||0} previsões • Gustavo: {backup.summary?.Gustavo?.transactions||0} lançamentos / {backup.summary?.Gustavo?.forecasts||0} previsões</small></span><button className="secondary" onClick={()=>restoreBackup(backup)}>Restaurar</button></div>)}</div>:<div className="backup-empty"><LockKeyhole size={18}/><span>A primeira cópia será criada automaticamente na próxima sincronização.</span></div>}
+      </div>
     </div>
   </>;
 }
