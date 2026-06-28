@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle, ArrowDownLeft, ArrowUpRight, Bell, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleDollarSign,
-  CreditCard, GripVertical, House, LayoutDashboard, LockKeyhole, LogOut, Menu, MoreHorizontal, Palette, Phone, PiggyBank,
+  CreditCard, Grid2X2, GripVertical, House, LayoutDashboard, LockKeyhole, LogOut, Menu, MoreHorizontal, Palette, Phone, PiggyBank,
   Check, ClipboardList, Edit3, ExternalLink, Eye, Link2, MessageCircle, Plus, ReceiptText, Search, Settings, Sparkles, Target, Trash2,
   UserPlus, UserRound, Users, WalletCards, X
 } from "lucide-react";
@@ -18,7 +18,7 @@ const localDateKey = () => {
 const dateLabel = (value = new Date()) => new Intl.DateTimeFormat("pt-BR").format(value instanceof Date ? value : new Date(value));
 const transactionTimestamp = (transaction) => Number(transaction.createdAt || transaction.id) || 0;
 const forecastIsConfirmed = (forecast) => forecast.actualConfirmed ?? Boolean(forecast.transactionId);
-const forecastIsAutomaticFixed = (forecast) => forecast.type === "expense" && forecast.recurrence === "fixed";
+const forecastIsAutomaticFixed = (forecast) => forecast?.recurrence === "fixed";
 const HISTORY_RESET_VERSION = "2026-06-22-limpeza-completa-v3";
 const alertIsDue = (alert) => alert.active && (!alert.activationDate || alert.activationDate <= localDateKey());
 const formatPhone = (value) => {
@@ -247,8 +247,9 @@ export default function Home() {
     if(forecastIsAutomaticFixed(forecast))return false;
     return Boolean(forecast && forecastIsConfirmed(forecast) && forecast.transactionId===transaction.id);
   });
-  const automaticFixedExpenses = financialMonthForecasts.filter(forecastIsAutomaticFixed).reduce((sum,forecast)=>sum+forecast.planned,0);
-  const realizedIncome = financialMonthTransactions.filter(t => t.type === "income" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0);
+  const automaticFixedIncome = financialMonthForecasts.filter(forecast=>forecast.type==="income"&&forecastIsAutomaticFixed(forecast)).reduce((sum,forecast)=>sum+forecast.planned,0);
+  const automaticFixedExpenses = financialMonthForecasts.filter(forecast=>forecast.type==="expense"&&forecastIsAutomaticFixed(forecast)).reduce((sum,forecast)=>sum+forecast.planned,0);
+  const realizedIncome = financialMonthTransactions.filter(t => t.type === "income" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + automaticFixedIncome;
   const realizedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + automaticFixedExpenses;
   const plannedIncome = financialMonthForecasts.filter(f => f.type === "income").reduce((s, f) => s + f.planned, 0);
   const plannedExpenses = financialMonthForecasts.filter(f => f.type === "expense").reduce((s, f) => s + f.planned, 0);
@@ -342,7 +343,7 @@ export default function Home() {
           {page === "Configurações" && <SettingsPage data={data} update={update} navItems={navItems} />}
         </div>
       </main>
-      {modal && <Modal type={modal} onClose={() => setModal(null)} data={data} setData={setData} user={user} />}
+      {modal === "monthly-sheet" ? <MonthlySpreadsheetModal data={data} user={user} onClose={() => setModal(null)} /> : modal && <Modal type={modal} onClose={() => setModal(null)} data={data} setData={setData} user={user} />}
     </div>
   );
 }
@@ -417,7 +418,7 @@ function Dashboard({ data, user, balance, realizedIncome, realizedExpenses, plan
   const remainingGoal = Math.max((data.savings.goal||0)-data.savings.balance,0);
   const monthContributions = ["Rebeca","Gustavo"].map(person=>({person,amount:(data.savings.movements||[]).filter(m=>m.month===data.month&&m.type==="entry"&&(m.person===person||m.owner===person)).reduce((sum,m)=>sum+m.amount,0)}));
   const fixedCategoryExpenses=(user.forecasts||[])
-    .filter(f=>f.month===data.month&&forecastIsAutomaticFixed(f)&&user.cards.find(card=>card.id===f.cardId)?.cardType!=="food")
+    .filter(f=>f.month===data.month&&f.type==="expense"&&forecastIsAutomaticFixed(f)&&user.cards.find(card=>card.id===f.cardId)?.cardType!=="food")
     .map(f=>({category:f.category,amount:f.planned}));
   return <>
     <div className="page-title dashboard-welcome"><div><h1>Olá, {data.activeUser}! 👋</h1><p>Aqui está o resumo de {data.month.toLowerCase()}.</p></div>
@@ -525,7 +526,7 @@ function Planning({ data, setData, user, setModal, month }) {
   const financialForecasts = monthForecasts.filter(f=>user.cards.find(c=>c.id===f.cardId)?.cardType!=="food");
   const plannedIncome = financialForecasts.filter(f => f.type === "income").reduce((s,f)=>s+f.planned,0);
   const plannedExpenses = financialForecasts.filter(f => f.type === "expense").reduce((s,f)=>s+f.planned,0);
-  const actualIncome = financialForecasts.filter(f => f.type === "income" && forecastIsConfirmed(f)).reduce((s,f)=>s+(f.actual || 0),0) + unplanned.filter(t=>t.type==="income"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
+  const actualIncome = financialForecasts.filter(f => f.type === "income" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="income"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
   const actualExpenses = financialForecasts.filter(f => f.type === "expense" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
   const plannedTotal = plannedIncome - plannedExpenses;
   const actualTotal = actualIncome - actualExpenses;
@@ -591,7 +592,10 @@ function Planning({ data, setData, user, setModal, month }) {
 
   return <>
     <PageTitle eyebrow="ORGANIZE ANTES DE GASTAR" title={`Planejamento de ${month}`} subtitle="Sua previsão mensal em formato de planilha, com o realizado ao lado.">
-      <button className="primary" onClick={() => setModal("forecast")}><Plus size={18}/> Adicionar previsão</button>
+      <div className="planning-title-actions">
+        <button className="monthly-sheet-button" onClick={() => setModal("monthly-sheet")}><Grid2X2 size={17}/><span>Planilha do mês</span></button>
+        <button className="primary" onClick={() => setModal("forecast")}><Plus size={18}/> Adicionar previsão</button>
+      </div>
     </PageTitle>
     <section className="planning-hero">
       <div><span>SALDO PREVISTO</span><strong>{money(plannedTotal)}</strong><small>receitas menos despesas</small></div>
@@ -609,6 +613,48 @@ function Planning({ data, setData, user, setModal, month }) {
       {unplanned.length ? <div className="panel unplanned-list">{unplanned.map(t=><div className="unplanned-row" key={t.id}><div className={`tx-icon ${t.type}`}>{t.type==="income"?<ArrowUpRight/>:<ArrowDownLeft/>}</div><span><b>{t.title}</b><small>{t.category}{t.reason ? ` • ${t.reason}` : ""}</small></span><strong>{t.type==="income"?"+":"−"} {money(t.amount)}</strong></div>)}</div> : <div className="panel empty-unplanned"><Sparkles size={18}/><span>Nenhuma movimentação fora do planejamento em {month.toLowerCase()}.</span></div>}
     </section>
   </>;
+}
+
+function MonthlySpreadsheetModal({data,user,onClose}){
+  const [selected,setSelected]=useState([]);
+  const monthForecasts=(user.forecasts||[]).filter(f=>f.month===data.month);
+  const unplanned=(user.transactions||[]).filter(t=>t.month===data.month&&t.unplanned&&user.cards.find(card=>card.id===t.cardId)?.cardType!=="food");
+  const forecastRows=monthForecasts.map(f=>{
+    const automatic=forecastIsAutomaticFixed(f),realized=automatic||forecastIsConfirmed(f),benefit=user.cards.find(card=>card.id===f.cardId)?.cardType==="food";
+    return {id:`forecast-${f.id}`,type:f.type,description:f.description,category:f.category,source:`${automatic?"Fixo automático":"Planejado"}${benefit?" • Benefício":""}`,value:realized?(automatic?f.planned:(f.actual||0)):null,countsInTotals:!benefit};
+  });
+  const unplannedRows=unplanned.map(t=>({id:`transaction-${t.id}`,type:t.type,description:t.title,category:t.category,source:"Fora do planejado",value:t.status==="Realizado"?t.amount:null,countsInTotals:true}));
+  const rows=[...forecastRows,...unplannedRows];
+  const incomes=rows.filter(row=>row.type==="income"),expenses=rows.filter(row=>row.type==="expense");
+  const totalIncome=incomes.reduce((sum,row)=>sum+(row.countsInTotals?row.value||0:0),0),totalExpenses=expenses.reduce((sum,row)=>sum+(row.countsInTotals?row.value||0:0),0);
+  const selectedRows=rows.filter(row=>selected.includes(row.id));
+  const selectedCredits=selectedRows.filter(row=>row.type==="income").reduce((sum,row)=>sum+(row.value||0),0);
+  const selectedDebits=selectedRows.filter(row=>row.type==="expense").reduce((sum,row)=>sum+(row.value||0),0);
+  const toggle=id=>setSelected(current=>current.includes(id)?current.filter(item=>item!==id):[...current,id]);
+  const renderGroup=(title,type,items)=> <section className={`monthly-sheet-group ${type}`}>
+    <div className="monthly-sheet-group-head"><span>{title}</span><b>{money(items.reduce((sum,row)=>sum+(row.countsInTotals?row.value||0:0),0))}</b></div>
+    <div className="monthly-sheet-table">
+      <div className="monthly-sheet-row head"><span>Descrição</span><span>Categoria</span><span>Origem</span><span>Realizado</span></div>
+      {items.map(row=><div className={`monthly-sheet-row ${selected.includes(row.id)?"selected":""}`} key={row.id}><span><b>{row.description}</b></span><span>{row.category||"Sem categoria"}</span><span><i>{row.source}</i></span><button type="button" disabled={row.value===null} aria-pressed={selected.includes(row.id)} onClick={()=>toggle(row.id)}>{row.value===null?<small>Pendente</small>:money(row.value)}</button></div>)}
+      {!items.length&&<div className="monthly-sheet-empty">Nenhum lançamento neste grupo.</div>}
+    </div>
+  </section>;
+  return <div className="modal-backdrop monthly-sheet-backdrop" onMouseDown={event=>event.target===event.currentTarget&&onClose()}>
+    <div className="monthly-sheet-modal" role="dialog" aria-modal="true" aria-labelledby="monthly-sheet-title">
+      <button className="modal-close" aria-label="Fechar planilha do mês" onClick={onClose}><X/></button>
+      <div className="monthly-sheet-title"><span>VISÃO SOMENTE LEITURA</span><h2 id="monthly-sheet-title">Planilha de {data.month}</h2><p>Selecione as células de valores para conferir créditos e débitos.</p></div>
+      <div className="monthly-sheet-totals">
+        <div className="income"><span>Total de receitas</span><b>{money(totalIncome)}</b></div>
+        <div className="expense"><span>Total de despesas</span><b>{money(totalExpenses)}</b></div>
+        <div className={totalIncome-totalExpenses>=0?"balance positive":"balance negative"}><span>Sobrou</span><b>{money(totalIncome-totalExpenses)}</b></div>
+      </div>
+      <div className="monthly-sheet-selection">
+        <span><Grid2X2 size={16}/>{selected.length?`${selected.length} ${selected.length===1?"célula selecionada":"células selecionadas"}`:"Selecione valores na planilha"}</span>
+        <div><i>Créditos <b>{money(selectedCredits)}</b></i><i>Débitos <b>{money(selectedDebits)}</b></i><i className={selectedCredits-selectedDebits>=0?"positive":"negative"}>Saldo <b>{money(selectedCredits-selectedDebits)}</b></i></div>
+      </div>
+      <div className="monthly-sheet-groups">{renderGroup("Receitas","income",incomes)}{renderGroup("Despesas","expense",expenses)}</div>
+    </div>
+  </div>;
 }
 
 function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}){
@@ -634,7 +680,7 @@ function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual
         <span className="sheet-description"><b>{f.description}</b><small>{f.month}{f.installment?` • Parcela ${f.installment}`:f.recurrence==="fixed"?" • Fixo":""}</small></span>
         <span className="sheet-description"><b>{f.category}</b><small>{f.person}</small></span>
         {automatic?<label className="fixed-planned-cell"><span>R$</span><input aria-label={`Valor fixo de ${f.description}`} type="number" min="0" step="0.01" value={f.planned} onChange={e=>updateFixedPlanned(f,e.target.value)}/></label>:<strong>{money(f.planned)}</strong>}
-        {automatic?<span className="fixed-auto-cell"><Check size={14}/><b>{money(f.planned)}</b><small>Débito automático</small></span>:<label className={`actual-cell ${confirmed?"confirmed":""}`}><span>R$</span><input aria-label={`Realizado de ${f.description}`} disabled={confirmed} type="number" min="0" step="0.01" value={f.actual??""} placeholder="0,00" onChange={e=>updateActual(f,e.target.value)}/></label>}
+        {automatic?<span className="fixed-auto-cell"><Check size={14}/><b>{money(f.planned)}</b><small>{f.type==="income"?"Crédito automático":"Débito automático"}</small></span>:<label className={`actual-cell ${confirmed?"confirmed":""}`}><span>R$</span><input aria-label={`Realizado de ${f.description}`} disabled={confirmed} type="number" min="0" step="0.01" value={f.actual??""} placeholder="0,00" onChange={e=>updateActual(f,e.target.value)}/></label>}
         <strong className={automatic?"muted-value":f.actual==null?"muted-value":rowDiff>=0?"positive-value":"negative-value"}>{automatic?"Sem variação":f.actual==null?"Aguardando":`${rowDiff>=0?"+":"−"} ${money(Math.abs(rowDiff))}`}</strong>
         <span className="actual-status">{automatic?<span className="fixed-status"><Check size={14}/> Automático</span>:confirmed?<button className="completed" onClick={()=>reopenActual(f)}><Check size={14}/> Concluído</button>:f.actual!=null?<button className="confirm" onClick={()=>confirmActual(f)}><Check size={14}/> Confirmar</button>:<i>Aguardando</i>}</span>
         <button className="delete-button" aria-label={`Remover previsão ${f.description}`} onClick={()=>removeForecast(f)}><Trash2 size={16}/></button>
