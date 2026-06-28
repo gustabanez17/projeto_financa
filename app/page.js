@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle, ArrowDownLeft, ArrowUpRight, Bell, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleDollarSign,
   CreditCard, Grid2X2, GripVertical, House, LayoutDashboard, LockKeyhole, LogOut, Menu, MoreHorizontal, Palette, Phone, PiggyBank,
@@ -89,7 +89,7 @@ const navItems = [
 ];
 
 export default function Home() {
-  const [data, setData] = useState(initialData);
+  const [data, setStoredData] = useState(initialData);
   const [ready, setReady] = useState(false);
   const [page, setPage] = useState("Visão geral");
   const [modal, setModal] = useState(null);
@@ -99,13 +99,32 @@ export default function Home() {
   const [authReady, setAuthReady] = useState(false);
   const [remoteLoaded, setRemoteLoaded] = useState(false);
   const [syncError, setSyncError] = useState("");
+  const [syncTick, setSyncTick] = useState(0);
+  const dataRef = useRef(initialData);
+  const pendingMutationsRef = useRef([]);
+  const syncInFlightRef = useRef(false);
+  const setData = useCallback((updater) => {
+    const mutation = typeof updater === "function" ? updater : () => updater;
+    pendingMutationsRef.current.push(mutation);
+    setStoredData(current => {
+      const next = mutation(current);
+      dataRef.current = next;
+      return next;
+    });
+  }, []);
+  const applyRemoteData = useCallback((next) => {
+    dataRef.current = next;
+    setStoredData(current => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+  }, []);
 
   useEffect(() => {
     if(!supabase){setAuthReady(true);return;}
     supabase.auth.getSession().then(({data:{session}})=>{setSession(session);setAuthReady(true);});
     const {data:{subscription}}=supabase.auth.onAuthStateChange((_event,nextSession)=>{
-      setSession(nextSession);
-      setRemoteLoaded(false);
+      setSession(currentSession=>{
+        if(currentSession?.user?.id!==nextSession?.user?.id)setRemoteLoaded(false);
+        return nextSession;
+      });
     });
     return ()=>subscription.unsubscribe();
   }, []);
@@ -180,7 +199,8 @@ export default function Home() {
       parsed.savings.movements ||= [];
       parsed.savings.goals ||= parsed.savings.goal > 0 ? [{id:Date.now(),name:"Meta principal",amount:parsed.savings.goal,type:parsed.savings.goalType,months:parsed.savings.goalMonths}] : [];
       parsed.savings.activeGoalId ||= parsed.savings.goals[0]?.id || null;
-      setData(parsed);
+      dataRef.current = parsed;
+      setStoredData(parsed);
     }
     setReady(true);
   }, []);
@@ -191,8 +211,8 @@ export default function Home() {
       setSyncError("");
       const {data:row,error}=await supabase.from("finance_app_state").select("data").eq("id","couple").maybeSingle();
       if(cancelled)return;
-      if(error){setSyncError("Não foi possível carregar os dados compartilhados.");return;}
-      if(row?.data)setData(row.data);
+      if(error){setSyncError("Não foi possível carregar os dados compartilhados.");setRemoteLoaded(true);return;}
+      if(row?.data)applyRemoteData(row.data);
       else {
         const {error:createError}=await supabase.from("finance_app_state").upsert({
           id:"couple",
@@ -200,39 +220,71 @@ export default function Home() {
           updated_by:session.user.id,
           updated_at:new Date().toISOString()
         });
-        if(createError){setSyncError("Não foi possível criar o espaço compartilhado.");return;}
+        if(createError){setSyncError("Não foi possível criar o espaço compartilhado.");setRemoteLoaded(true);return;}
       }
       setRemoteLoaded(true);
     };
     loadSharedState();
     return ()=>{cancelled=true;};
-  }, [ready,session?.user?.id]);
+  }, [ready,session?.user?.id,applyRemoteData]);
   useEffect(() => {
     if(ready)localStorage.setItem("financas-v2",JSON.stringify(data));
-    if(!ready||!remoteLoaded||!session||!supabase)return;
+    if(!ready||!remoteLoaded||!session||!supabase||pendingMutationsRef.current.length===0)return;
     const timer=setTimeout(async()=>{
-      const {error}=await supabase.from("finance_app_state").upsert({
-        id:"couple",
-        data,
-        updated_by:session.user.id,
-        updated_at:new Date().toISOString()
-      });
-      setSyncError(error?"Não foi possível sincronizar a última alteração.":"");
+      if(syncInFlightRef.current)return;
+      syncInFlightRef.current=true;
+      const mutations=pendingMutationsRef.current.splice(0);
+      try {
+        let merged=null;
+        let saved=false;
+        for(let attempt=0;attempt<4&&!saved;attempt+=1){
+          const {data:row,error:loadError}=await supabase.from("finance_app_state").select("data,updated_at").eq("id","couple").maybeSingle();
+          if(loadError)throw loadError;
+          const base=row?.data||dataRef.current;
+          merged=mutations.reduce((current,mutation)=>mutation(current),base);
+          const updatedAt=new Date().toISOString();
+          if(!row){
+            const {error}=await supabase.from("finance_app_state").upsert({id:"couple",data:merged,updated_by:session.user.id,updated_at:updatedAt});
+            if(error)throw error;
+            saved=true;
+          } else {
+            const {data:updatedRow,error}=await supabase.from("finance_app_state")
+              .update({data:merged,updated_by:session.user.id,updated_at:updatedAt})
+              .eq("id","couple")
+              .eq("updated_at",row.updated_at)
+              .select("updated_at")
+              .maybeSingle();
+            if(error)throw error;
+            saved=Boolean(updatedRow);
+          }
+        }
+        if(!saved)throw new Error("Conflito ao sincronizar alterações compartilhadas.");
+        setSyncError("");
+        const withNewerLocalChanges=pendingMutationsRef.current.reduce((current,mutation)=>mutation(current),merged);
+        applyRemoteData(withNewerLocalChanges);
+      } catch (_error) {
+        pendingMutationsRef.current.unshift(...mutations);
+        setSyncError("Não foi possível sincronizar a última alteração.");
+      } finally {
+        syncInFlightRef.current=false;
+        if(pendingMutationsRef.current.length)setSyncTick(current=>current+1);
+      }
     },500);
     return ()=>clearTimeout(timer);
-  }, [data,ready,remoteLoaded,session?.user?.id]);
+  }, [data,ready,remoteLoaded,session?.user?.id,syncTick,applyRemoteData]);
   useEffect(() => {
     if(!remoteLoaded||!session||!supabase)return;
     const channel=supabase.channel("finance-couple-state")
       .on("postgres_changes",{event:"UPDATE",schema:"public",table:"finance_app_state",filter:"id=eq.couple"},payload=>{
         if(!payload.new?.data)return;
-        setData(current=>JSON.stringify(current)===JSON.stringify(payload.new.data)?current:payload.new.data);
+        if(syncInFlightRef.current||pendingMutationsRef.current.length)return;
+        applyRemoteData(payload.new.data);
       })
       .subscribe();
     return ()=>{supabase.removeChannel(channel);};
-  }, [remoteLoaded,session?.user?.id]);
+  }, [remoteLoaded,session?.user?.id,applyRemoteData]);
 
-  if(!ready||!authReady)return <div className="app-loading" aria-label="Carregando preferências"/>;
+  if(!ready||!authReady||(session&&supabase&&!remoteLoaded))return <div className="app-loading" aria-label="Carregando preferências"/>;
   if(!supabaseConfigured)return <LoginSetup/>;
   if(!session)return <LoginScreen/>;
 
@@ -617,6 +669,10 @@ function Planning({ data, setData, user, setModal, month }) {
 
 function MonthlySpreadsheetModal({data,user,onClose}){
   const [selected,setSelected]=useState([]);
+  const [filters,setFilters]=useState({
+    income:{search:"",category:"",source:""},
+    expense:{search:"",category:"",source:""}
+  });
   const monthForecasts=(user.forecasts||[]).filter(f=>f.month===data.month);
   const unplanned=(user.transactions||[]).filter(t=>t.month===data.month&&t.unplanned&&user.cards.find(card=>card.id===t.cardId)?.cardType!=="food");
   const forecastRows=monthForecasts.map(f=>{
@@ -631,14 +687,29 @@ function MonthlySpreadsheetModal({data,user,onClose}){
   const selectedCredits=selectedRows.filter(row=>row.type==="income").reduce((sum,row)=>sum+(row.value||0),0);
   const selectedDebits=selectedRows.filter(row=>row.type==="expense").reduce((sum,row)=>sum+(row.value||0),0);
   const toggle=id=>setSelected(current=>current.includes(id)?current.filter(item=>item!==id):[...current,id]);
-  const renderGroup=(title,type,items)=> <section className={`monthly-sheet-group ${type}`}>
-    <div className="monthly-sheet-group-head"><span>{title}</span><b>{money(items.reduce((sum,row)=>sum+(row.countsInTotals?row.value||0:0),0))}</b></div>
-    <div className="monthly-sheet-table">
-      <div className="monthly-sheet-row head"><span>Descrição</span><span>Categoria</span><span>Origem</span><span>Realizado</span></div>
-      {items.map(row=><div className={`monthly-sheet-row ${selected.includes(row.id)?"selected":""}`} key={row.id}><span><b>{row.description}</b></span><span>{row.category||"Sem categoria"}</span><span><i>{row.source}</i></span><button type="button" disabled={row.value===null} aria-pressed={selected.includes(row.id)} onClick={()=>toggle(row.id)}>{row.value===null?<small>Pendente</small>:money(row.value)}</button></div>)}
-      {!items.length&&<div className="monthly-sheet-empty">Nenhum lançamento neste grupo.</div>}
-    </div>
-  </section>;
+  const updateFilter=(type,key,value)=>setFilters(current=>({...current,[type]:{...current[type],[key]:value}}));
+  const renderGroup=(title,type,items)=>{
+    const groupFilters=filters[type];
+    const categories=[...new Set(items.map(row=>row.category||"Sem categoria"))].sort((a,b)=>a.localeCompare(b,"pt-BR"));
+    const sources=[...new Set(items.map(row=>row.source))].sort((a,b)=>a.localeCompare(b,"pt-BR"));
+    const search=groupFilters.search.trim().toLocaleLowerCase("pt-BR");
+    const visibleItems=items.filter(row=>(!search||[row.description,row.category,row.source].some(value=>(value||"").toLocaleLowerCase("pt-BR").includes(search)))
+      &&(!groupFilters.category||(row.category||"Sem categoria")===groupFilters.category)
+      &&(!groupFilters.source||row.source===groupFilters.source));
+    return <section className={`monthly-sheet-group ${type}`}>
+      <div className="monthly-sheet-group-head"><span>{title}</span><b>{money(items.reduce((sum,row)=>sum+(row.countsInTotals?row.value||0:0),0))}</b></div>
+      <div className="monthly-sheet-filters">
+        <label className="monthly-sheet-search"><Search size={14}/><input value={groupFilters.search} onChange={event=>updateFilter(type,"search",event.target.value)} placeholder="Pesquisar..." aria-label={`Pesquisar ${title.toLowerCase()}`}/></label>
+        <CustomSelect className="monthly-sheet-filter-select" ariaLabel={`Filtrar ${title.toLowerCase()} por categoria`} value={groupFilters.category} options={[{value:"",label:"Todas as categorias"},...categories.map(category=>({value:category,label:category}))]} onChange={value=>updateFilter(type,"category",value)}/>
+        <CustomSelect className="monthly-sheet-filter-select" ariaLabel={`Filtrar ${title.toLowerCase()} por origem`} value={groupFilters.source} options={[{value:"",label:"Todas as origens"},...sources.map(source=>({value:source,label:source}))]} onChange={value=>updateFilter(type,"source",value)}/>
+      </div>
+      <div className="monthly-sheet-table">
+        <div className="monthly-sheet-row head"><span>Descrição</span><span>Categoria</span><span>Origem</span><span>Realizado</span></div>
+        {visibleItems.map(row=><div className={`monthly-sheet-row ${selected.includes(row.id)?"selected":""}`} key={row.id}><span><b>{row.description}</b></span><span className="monthly-sheet-category">{row.category||"Sem categoria"}</span><span><i>{row.source}</i></span><button type="button" disabled={row.value===null} aria-pressed={selected.includes(row.id)} onClick={()=>toggle(row.id)}>{row.value===null?<small>Pendente</small>:money(row.value)}</button></div>)}
+        {!visibleItems.length&&<div className="monthly-sheet-empty">Nenhum resultado encontrado.</div>}
+      </div>
+    </section>;
+  };
   return <div className="modal-backdrop monthly-sheet-backdrop" onMouseDown={event=>event.target===event.currentTarget&&onClose()}>
     <div className="monthly-sheet-modal" role="dialog" aria-modal="true" aria-labelledby="monthly-sheet-title">
       <button className="modal-close" aria-label="Fechar planilha do mês" onClick={onClose}><X/></button>
