@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "../lib/supabase";
 import { applySyncPatches, collectSyncPatches } from "../lib/finance-sync.mjs";
+import { cycleQuoteItemStatus, fixedExpensePaymentStatus, normalizeQuoteItemStatus, toggleFixedExpensePaymentStatus } from "../lib/finance-status.mjs";
 
 const money = (value) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value);
 const months = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
@@ -200,6 +201,11 @@ export default function Home() {
         const accountQuotes=[...(parsed.users.Rebeca.quotes||[]),...(parsed.users.Gustavo.quotes||[])];
         parsed.sharedQuotes=accountQuotes.filter((quote,index,list)=>list.findIndex(item=>String(item.id)===String(quote.id))===index);
       }
+      parsed.sharedQuotes=(parsed.sharedQuotes||[]).map(quote=>({
+        ...quote,
+        status:quote.status==="Concluída"?"Concluída":"Em andamento",
+        items:(quote.items||[]).map(item=>({...item,status:normalizeQuoteItemStatus(item)}))
+      }));
       parsed.users.Rebeca.forecasts ||= [];
       parsed.users.Gustavo.forecasts ||= [];
       parsed.users.Rebeca.people ||= [];
@@ -696,6 +702,12 @@ function Planning({ data, setData, user, setModal, month }) {
     return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts:list}}};
   });
 
+  const toggleFixedPaymentStatus = (forecast) => setData(d=>{
+    const account=d.users[d.activeUser];
+    const forecasts=account.forecasts.map(item=>item.id===forecast.id?{...item,fixedPaymentStatus:toggleFixedExpensePaymentStatus(item)}:item);
+    return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts}}};
+  });
+
   return <>
     <PageTitle eyebrow="ORGANIZE ANTES DE GASTAR" title={`Planejamento de ${month}`} subtitle="Sua previsão mensal em formato de planilha, com o realizado ao lado.">
       <div className="planning-title-actions">
@@ -711,8 +723,8 @@ function Planning({ data, setData, user, setModal, month }) {
       <div className={leftover >= 0 ? "positive" : "negative"}><span>SOBROU</span><strong>{leftover < 0 ? "− " : ""}{money(Math.abs(leftover))}</strong><small>{leftover >= 0 ? "receitas menos despesas do mês" : "despesas acima das receitas"}</small></div>
     </section>
     <div className="planning-groups">
-      <PlanningGroup title="Planejamento de Receitas" eyebrow="ENTRADAS PREVISTAS" type="income" total={plannedIncome} items={monthForecasts.filter(f=>f.type==="income")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
-      <PlanningGroup title="Planejamento de Despesas" eyebrow="SAÍDAS PREVISTAS" type="expense" total={plannedExpenses} items={monthForecasts.filter(f=>f.type==="expense")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}}/>
+      <PlanningGroup title="Planejamento de Receitas" eyebrow="ENTRADAS PREVISTAS" type="income" total={plannedIncome} items={monthForecasts.filter(f=>f.type==="income")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast,toggleFixedPaymentStatus}}/>
+      <PlanningGroup title="Planejamento de Despesas" eyebrow="SAÍDAS PREVISTAS" type="expense" total={plannedExpenses} items={monthForecasts.filter(f=>f.type==="expense")} people={user.people} cards={user.cards} {...{updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast,toggleFixedPaymentStatus}}/>
     </div>
     <section className="unplanned-section">
       <div className="unplanned-head"><div><span>FORA DO PLANEJADO</span><h2>Movimentações não previstas</h2></div><b>{money(unplanned.filter(t=>t.status==="Realizado").reduce((sum,t)=>sum+(t.type==="income"?t.amount:-t.amount),0))}</b></div>
@@ -782,12 +794,13 @@ function MonthlySpreadsheetModal({data,user,onClose}){
   </div>;
 }
 
-function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast}){
+function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual,updateFixedPlanned,confirmActual,reopenActual,removeForecast,reorderForecast,toggleFixedPaymentStatus}){
   const [search,setSearch]=useState(""),[person,setPerson]=useState(""),[card,setCard]=useState(""),[status,setStatus]=useState(""),[page,setPage]=useState(1);
+  const displayStatus=f=>forecastIsAutomaticFixed(f)&&f.type==="expense"?fixedExpensePaymentStatus(f):(forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))?"Concluído":"Pendente";
   const filtered=items.filter(f=>(!search||f.description.toLowerCase().includes(search.toLowerCase()))
     &&(!person||String(f.personId||"")===person)
     &&(!card||(card==="none"?!f.cardId:String(f.cardId||"")===card))
-    &&(!status||((forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))?"Realizado":"Pendente")===status));
+    &&(!status||displayStatus(f)===status));
   const pages=Math.max(1,Math.ceil(filtered.length/6)),current=Math.min(page,pages),visible=filtered.slice((current-1)*6,current*6);
   useEffect(()=>setPage(1),[search,person,card,status]);
   return <section className={`planning-group ${type}`}>
@@ -796,10 +809,10 @@ function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual
       <label className="filter-search"><Search size={15}/><input aria-label={`Pesquisar em ${title}`} value={search} onChange={e=>setSearch(e.target.value)} placeholder="Pesquisar previsão..."/></label>
       <CustomSelect ariaLabel={`Pessoa em ${title}`} value={person} onChange={setPerson} options={[{value:"",label:"Todas as pessoas"},...people.map(p=>({value:String(p.id),label:p.name}))]}/>
       <CustomSelect ariaLabel={`Cartão em ${title}`} value={card} onChange={setCard} options={[{value:"",label:"Todos os cartões"},{value:"none",label:"Sem cartão"},...cards.map(c=>({value:String(c.id),label:c.name}))]}/>
-      <CustomSelect ariaLabel={`Status em ${title}`} value={status} onChange={setStatus} options={[{value:"",label:"Todos os status"},{value:"Pendente",label:"Pendente"},{value:"Realizado",label:"Concluído"}]}/>
+      <CustomSelect ariaLabel={`Status em ${title}`} value={status} onChange={setStatus} options={[{value:"",label:"Todos os status"},{value:"Pendente",label:"Pendente"},{value:"Concluído",label:"Concluído"},...(type==="expense"?[{value:"Pago",label:"Pago"}]:[])]}/>
     </div>
     <div className="panel planning-sheet"><div className="sheet-scroll">
-      <div className="sheet-row sheet-head"><span></span><span>Descrição</span><span>Categoria / Pessoa</span><span>Previsto</span><span>Realizado</span><span>Diferença</span><span>Situação</span><span></span></div>
+      <div className="sheet-row sheet-head"><span></span><span>Descrição</span><span>Categoria / Pessoa</span><span>Previsto</span><span>Realizado</span><span>Diferença</span><span>{type==="expense"?"Status":"Situação"}</span><span></span></div>
       {visible.map(f=>{const automatic=forecastIsAutomaticFixed(f),effectiveActual=automatic?f.planned:(f.actual||0),rowDiff=f.type==="expense"?f.planned-effectiveActual:effectiveActual-f.planned,confirmed=automatic||forecastIsConfirmed(f);return <div className={`sheet-row draggable-row ${automatic?"automatic-fixed-row":""}`} draggable onDragStart={e=>{e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",String(f.id));}} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();reorderForecast(Number(e.dataTransfer.getData("text/plain")),f.id);}} key={f.id}>
         <span className="drag-handle" title="Arraste para reorganizar"><GripVertical size={17}/></span>
         <span className="sheet-description"><b>{f.description}</b><small>{f.month}{f.installment?` • Parcela ${f.installment}`:f.recurrence==="fixed"?" • Fixo":""}</small></span>
@@ -807,7 +820,7 @@ function PlanningGroup({title,eyebrow,type,total,items,people,cards,updateActual
         {automatic?<label className="fixed-planned-cell"><span>R$</span><input aria-label={`Valor fixo de ${f.description}`} type="number" min="0" step="0.01" value={f.planned} onChange={e=>updateFixedPlanned(f,e.target.value)}/></label>:<strong>{money(f.planned)}</strong>}
         {automatic?<span className="fixed-auto-cell"><Check size={14}/><b>{money(f.planned)}</b><small>{f.type==="income"?"Crédito automático":"Débito automático"}</small></span>:<label className={`actual-cell ${confirmed?"confirmed":""}`}><span>R$</span><input aria-label={`Realizado de ${f.description}`} disabled={confirmed} type="number" min="0" step="0.01" value={f.actual??""} placeholder="0,00" onChange={e=>updateActual(f,e.target.value)}/></label>}
         <strong className={automatic?"muted-value":f.actual==null?"muted-value":rowDiff>=0?"positive-value":"negative-value"}>{automatic?"Sem variação":f.actual==null?"Aguardando":`${rowDiff>=0?"+":"−"} ${money(Math.abs(rowDiff))}`}</strong>
-        <span className="actual-status">{automatic?<span className="fixed-status"><Check size={14}/> Automático</span>:confirmed?<button className="completed" onClick={()=>reopenActual(f)}><Check size={14}/> Concluído</button>:f.actual!=null?<button className="confirm" onClick={()=>confirmActual(f)}><Check size={14}/> Confirmar</button>:<i>Aguardando</i>}</span>
+        <span className="actual-status">{automatic&&f.type==="expense"?<button className={`fixed-payment-status ${fixedExpensePaymentStatus(f)==="Pago"?"paid":"pending"}`} onClick={()=>toggleFixedPaymentStatus(f)} aria-label={`Alterar ${f.description} para ${fixedExpensePaymentStatus(f)==="Pago"?"Pendente":"Pago"}`} aria-pressed={fixedExpensePaymentStatus(f)==="Pago"}>{fixedExpensePaymentStatus(f)==="Pago"?<Check size={14}/>:<CircleDollarSign size={14}/>} {fixedExpensePaymentStatus(f)}</button>:automatic?<span className="fixed-status"><Check size={14}/> Automático</span>:confirmed?<button className="completed" onClick={()=>reopenActual(f)}><Check size={14}/> Concluído</button>:f.actual!=null?<button className="confirm" onClick={()=>confirmActual(f)}><Check size={14}/> Confirmar</button>:<i>Aguardando</i>}</span>
         <button className="delete-button" aria-label={`Remover previsão ${f.description}`} onClick={()=>removeForecast(f)}><Trash2 size={16}/></button>
       </div>})}
       {!visible.length&&<div className="empty-state large"><Target size={27}/><b>Nenhuma previsão encontrada</b><span>Ajuste os filtros ou adicione uma nova previsão.</span></div>}
@@ -855,33 +868,37 @@ function Quotes({ data, setData, setModal }) {
   const [itemDraft, setItemDraft] = useState({name:"",link:"",value:""});
   const quotes = data.sharedQuotes || [];
   const selected = quotes.find(q=>q.id===selectedId) || quotes[0] || null;
+  const selectedCompleted = selected?.status === "Concluída";
   const updateQuotes = (updater) => setData(d=>({...d,sharedQuotes:updater(d.sharedQuotes||[])}));
-  const toggleItem = (quoteId,itemId) => updateQuotes(list=>list.map(q=>q.id===quoteId?{...q,items:q.items.map(i=>i.id===itemId?{...i,checked:!i.checked}:i)}:q));
+  const toggleItemStatus = (quoteId,itemId) => updateQuotes(list=>list.map(q=>q.id===quoteId?{...q,items:cycleQuoteItemStatus(q.items,itemId)}:q));
   const addItem = (e) => {
     e.preventDefault(); if(!selected)return;
     const fd=new FormData(e.currentTarget),name=fd.get("item").trim(),link=fd.get("link").trim(),value=Math.max(+fd.get("value")||0,0);
     if(!name)return;
-    updateQuotes(list=>list.map(q=>q.id===selected.id?{...q,items:[...q.items,{id:Date.now(),name,link,value,checked:false}]}:q));
+    updateQuotes(list=>list.map(q=>q.id===selected.id?{...q,items:[...q.items,{id:Date.now(),name,link,value,status:"Analisando",checked:false}]}:q));
     e.currentTarget.reset();
   };
   const saveSubject = () => {const name=subjectDraft.trim();if(name&&selected)updateQuotes(list=>list.map(q=>q.id===selected.id?{...q,subject:name}:q));setEditingSubject(false);};
   const startItemEdit = (item) => {setEditingItemId(item.id);setItemDraft({name:item.name,link:item.link||"",value:item.value||""});};
   const saveItem = () => {if(!itemDraft.name.trim()||!selected)return;updateQuotes(list=>list.map(q=>q.id===selected.id?{...q,items:q.items.map(i=>i.id===editingItemId?{...i,name:itemDraft.name.trim(),link:itemDraft.link.trim(),value:Math.max(+itemDraft.value||0,0)}:i)}:q));setEditingItemId(null);};
   const removeItem = (quoteId,itemId) => updateQuotes(list=>list.map(q=>q.id===quoteId?{...q,items:q.items.filter(i=>i.id!==itemId)}:q));
-  const closeQuote = (id) => {updateQuotes(list=>list.filter(q=>q.id!==id));setSelectedId(null);};
+  const closeQuote = (id) => updateQuotes(list=>list.map(q=>q.id===id?{...q,status:"Concluída",completedAt:new Date().toISOString()}:q));
+  const reopenQuote = (id) => updateQuotes(list=>list.map(q=>q.id===id?{...q,status:"Em andamento",completedAt:null}:q));
+  const itemStatusClass = status => status==="Escolhida"?"chosen":status==="Cancelada"?"cancelled":"analyzing";
+  const itemStatusIcon = status => status==="Escolhida"?<Check size={14}/>:status==="Cancelada"?<X size={14}/>:<Search size={14}/>;
   return <>
-    <PageTitle eyebrow="LISTAS E PESQUISAS" title="Cotações" subtitle="Agrupe o que deseja comprar, salve referências e acompanhe cada checklist.">
+    <PageTitle eyebrow="LISTAS E PESQUISAS" title="Cotações" subtitle="Compare opções, escolha a melhor proposta e mantenha o histórico das decisões.">
       <button className="primary" onClick={()=>setModal("quote")}><Plus size={18}/> Criar cotação</button>
     </PageTitle>
     {quotes.length?<div className="quotes-layout">
       <aside className="quote-groups">
-        {quotes.map(q=>{const done=q.items.filter(i=>i.checked).length;return <button className={`quote-group-card ${selected?.id===q.id?"active":""}`} onClick={()=>setSelectedId(q.id)} key={q.id}><span><ClipboardList size={18}/><b>{q.subject}</b></span><small>{done} de {q.items.length} concluídos</small><i><b style={{width:`${q.items.length?done/q.items.length*100:0}%`}}/></i></button>})}
+        {quotes.map(q=><button className={`quote-group-card ${selected?.id===q.id?"active":""} ${q.status==="Concluída"?"completed":""}`} onClick={()=>setSelectedId(q.id)} key={q.id}><span><ClipboardList size={18}/><b>{q.subject}</b></span><small className={`quote-group-status ${q.status==="Concluída"?"completed":"active"}`}>{q.status==="Concluída"?<Check size={13}/>:<Search size={13}/>} {q.status==="Concluída"?"Concluída":"Em andamento"}</small><em>{q.items.length} {q.items.length===1?"opção":"opções"}</em></button>)}
       </aside>
       {selected&&<section className="panel quote-detail">
-        <div className="quote-detail-head"><div><span>COTAÇÃO SELECIONADA</span>{editingSubject?<div className="quote-subject-edit"><input aria-label="Editar nome da cotação" value={subjectDraft} onChange={e=>setSubjectDraft(e.target.value)}/><button onClick={saveSubject}><Check size={16}/></button><button onClick={()=>setEditingSubject(false)}><X size={16}/></button></div>:<div className="quote-title-row"><h2>{selected.subject}</h2><button className="edit-button" aria-label={`Editar cotação ${selected.subject}`} onClick={()=>{setSubjectDraft(selected.subject);setEditingSubject(true);}}><Edit3 size={15}/></button></div>}<p>{selected.items.length} {selected.items.length===1?"item":"itens"} na checklist</p></div><button className="close-quote-button" onClick={()=>closeQuote(selected.id)}><Check size={16}/> Encerrar cotação</button></div>
-        <div className="quote-checklist">{selected.items.map(item=>editingItemId===item.id?<div className="quote-item-edit" key={item.id}><input aria-label="Editar item da cotação" value={itemDraft.name} onChange={e=>setItemDraft(d=>({...d,name:e.target.value}))}/><input aria-label="Editar valor do item" type="number" min="0" step="0.01" value={itemDraft.value} onChange={e=>setItemDraft(d=>({...d,value:e.target.value}))}/><input aria-label="Editar link do item" type="url" value={itemDraft.link} onChange={e=>setItemDraft(d=>({...d,link:e.target.value}))}/><button className="edit-button" aria-label={`Salvar item ${item.name}`} onClick={saveItem}><Check size={16}/></button><button className="delete-button" aria-label="Cancelar edição do item" onClick={()=>setEditingItemId(null)}><X size={16}/></button></div>:<div className={`quote-item ${item.checked?"checked":""}`} key={item.id}><button className="quote-check" aria-label={`${item.checked?"Desmarcar":"Marcar"} ${item.name}`} onClick={()=>toggleItem(selected.id,item.id)}>{item.checked&&<Check size={15}/>}</button><span><b>{item.name}</b><small>{money(item.value||0)}</small>{item.link&&<a href={item.link.startsWith("http")?item.link:`https://${item.link}`} target="_blank" rel="noreferrer"><ExternalLink size={13}/> Abrir referência</a>}</span><div className="quote-item-actions"><button className="edit-button" aria-label={`Editar item ${item.name}`} onClick={()=>startItemEdit(item)}><Edit3 size={15}/></button><button className="delete-button" aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(selected.id,item.id)}><Trash2 size={15}/></button></div></div>)}</div>
-        {!selected.items.length&&<div className="empty-state compact"><ClipboardList size={24}/><b>Checklist vazia</b><span>Adicione abaixo o primeiro item desta cotação.</span></div>}
-        <form className="quote-add-form" onSubmit={addItem}><label>O que está sendo cotado?<input required name="item" placeholder="Ex.: Sofá para a sala"/></label><label>Valor<input required name="value" type="number" min="0" step="0.01" placeholder="0,00"/></label><label>Link de referência <small>(opcional)</small><div className="link-input"><Link2 size={15}/><input name="link" type="url" placeholder="https://loja.com/produto"/></div></label><button className="secondary" type="submit"><Plus size={16}/> Adicionar à checklist</button></form>
+        <div className="quote-detail-head"><div><span>{selectedCompleted?"COTAÇÃO CONCLUÍDA":"COTAÇÃO EM ANDAMENTO"}</span>{editingSubject?<div className="quote-subject-edit"><input aria-label="Editar nome da cotação" value={subjectDraft} onChange={e=>setSubjectDraft(e.target.value)}/><button onClick={saveSubject}><Check size={16}/></button><button onClick={()=>setEditingSubject(false)}><X size={16}/></button></div>:<div className="quote-title-row"><h2>{selected.subject}</h2>{!selectedCompleted&&<button className="edit-button" aria-label={`Editar cotação ${selected.subject}`} onClick={()=>{setSubjectDraft(selected.subject);setEditingSubject(true);}}><Edit3 size={15}/></button>}</div>}<p>{selected.items.length} {selected.items.length===1?"opção cotada":"opções cotadas"}</p></div>{selectedCompleted?<button className="reopen-quote-button" onClick={()=>reopenQuote(selected.id)}>Reabrir cotação</button>:<button className="close-quote-button" onClick={()=>closeQuote(selected.id)}><Check size={16}/> Encerrar cotação</button>}</div>
+        <div className="quote-checklist">{selected.items.map(item=>{const itemStatus=normalizeQuoteItemStatus(item);return editingItemId===item.id?<div className="quote-item-edit" key={item.id}><input aria-label="Editar item da cotação" value={itemDraft.name} onChange={e=>setItemDraft(d=>({...d,name:e.target.value}))}/><input aria-label="Editar valor do item" type="number" min="0" step="0.01" value={itemDraft.value} onChange={e=>setItemDraft(d=>({...d,value:e.target.value}))}/><input aria-label="Editar link do item" type="url" value={itemDraft.link} onChange={e=>setItemDraft(d=>({...d,link:e.target.value}))}/><button className="edit-button" aria-label={`Salvar item ${item.name}`} onClick={saveItem}><Check size={16}/></button><button className="delete-button" aria-label="Cancelar edição do item" onClick={()=>setEditingItemId(null)}><X size={16}/></button></div>:<div className={`quote-item ${itemStatusClass(itemStatus)}`} key={item.id}><button className={`quote-item-status ${itemStatusClass(itemStatus)}`} disabled={selectedCompleted} aria-label={`${item.name}: ${itemStatus}. Clique para alterar o status`} title={selectedCompleted?"Reabra a cotação para alterar":"Clique para alterar o status"} onClick={()=>toggleItemStatus(selected.id,item.id)}>{itemStatusIcon(itemStatus)}<span>{itemStatus}</span></button><span><b>{item.name}</b><small>{money(item.value||0)}</small>{item.link&&<a href={item.link.startsWith("http")?item.link:`https://${item.link}`} target="_blank" rel="noreferrer"><ExternalLink size={13}/> Abrir referência</a>}</span>{!selectedCompleted&&<div className="quote-item-actions"><button className="edit-button" aria-label={`Editar item ${item.name}`} onClick={()=>startItemEdit(item)}><Edit3 size={15}/></button><button className="delete-button" aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(selected.id,item.id)}><Trash2 size={15}/></button></div>}</div>})}</div>
+        {!selected.items.length&&<div className="empty-state compact"><ClipboardList size={24}/><b>Nenhuma opção adicionada</b><span>Adicione abaixo a primeira opção desta cotação.</span></div>}
+        {!selectedCompleted&&<form className="quote-add-form" onSubmit={addItem}><label>O que está sendo cotado?<input required name="item" placeholder="Ex.: Sofá para a sala"/></label><label>Valor<input required name="value" type="number" min="0" step="0.01" placeholder="0,00"/></label><label>Link de referência <small>(opcional)</small><div className="link-input"><Link2 size={15}/><input name="link" type="url" placeholder="https://loja.com/produto"/></div></label><button className="secondary" type="submit"><Plus size={16}/> Adicionar opção</button></form>}
       </section>}
     </div>:<div className="panel empty-state large"><ClipboardList size={30}/><b>Nenhuma cotação criada</b><span>Crie agrupamentos para móveis, casa, eletrodomésticos, animais ou qualquer compra futura.</span><button className="secondary" onClick={()=>setModal("quote")}><Plus size={16}/> Criar primeira cotação</button></div>}
   </>;
@@ -1174,7 +1191,7 @@ function Modal({ type, onClose, data, setData, user }) {
       const created=targetMonths.map((month,index)=>({id:seriesId+index,seriesId,type:kind,planned:perMonth,description:fd.get("description"),category:fd.get("category"),personId:person?.id || null,person:person?.name || "",cardId,card:card?.name||"",month,recurrence:forecastMode,installment:forecastMode==="installment"?`${index+1}/${count}`:null,actual:null,transactionId:null}));
       setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],forecasts:[...created,...(d.users[d.activeUser].forecasts || [])]}}}));
     }
-    else if(isQuote){const id=Date.now(),items=fd.get("items").split("\n").map(x=>x.trim()).filter(Boolean).map((name,index)=>({id:id+index+1,name,link:"",value:0,checked:false})),quote={id,subject:fd.get("subject").trim(),items};setData(d=>({...d,sharedQuotes:[quote,...(d.sharedQuotes||[])]}));}
+    else if(isQuote){const id=Date.now(),items=fd.get("items").split("\n").map(x=>x.trim()).filter(Boolean).map((name,index)=>({id:id+index+1,name,link:"",value:0,status:"Analisando",checked:false})),quote={id,subject:fd.get("subject").trim(),status:"Em andamento",items};setData(d=>({...d,sharedQuotes:[quote,...(d.sharedQuotes||[])]}));}
     else if(isHomeGroup){const group={id:Date.now(),name:fd.get("groupName").trim(),items:[]};setData(d=>({...d,homeGroups:[...(d.homeGroups||[]),group]}));}
     else if(isPerson){ const person={id:personExisting?.id||Date.now(),name:fd.get("name").trim(),whatsapp:fd.get("whatsapp").trim()}; setData(d=>{const account=d.users[d.activeUser];if(!isEditPerson)return {...d,users:{...d.users,[d.activeUser]:{...account,people:[person,...(account.people||[])]}}};return {...d,users:{...d.users,[d.activeUser]:{...account,people:account.people.map(p=>p.id===editPersonId?person:p),forecasts:account.forecasts.map(f=>f.personId===editPersonId?{...f,person:person.name}:f),transactions:account.transactions.map(t=>t.personId===editPersonId?{...t,person:person.name,usedBy:t.usedBy?person.name:t.usedBy}:t),alerts:account.alerts.map(a=>a.personId===editPersonId?{...a,personName:person.name,whatsapp:person.whatsapp}:a)}}}}); }
     else if(type==="saving"){ const amount=+fd.get("amount"); const movement={id:Date.now(),type:"entry",amount,description:`Contribuição de ${data.activeUser}`,person:data.activeUser,owner:data.activeUser,month:data.month,date:"Hoje"}; setData(d=>({...d,savings:{...d.savings,balance:d.savings.balance+amount,movements:[movement,...d.savings.movements],contributions:{...d.savings.contributions,[d.activeUser]:d.savings.contributions[d.activeUser]+amount}}})); }
