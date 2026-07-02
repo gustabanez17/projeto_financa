@@ -9,10 +9,16 @@ import {
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "../lib/supabase";
 import { applySyncPatches, collectSyncPatches } from "../lib/finance-sync.mjs";
+import { mirrorRelationalState } from "../lib/relational-sync.mjs";
 import { cycleQuoteItemStatus, fixedExpensePaymentStatus, normalizeQuoteItemStatus, toggleFixedExpensePaymentStatus } from "../lib/finance-status.mjs";
+import { addMonths, itemMatchesPeriod, MONTHS, normalizeItemPeriod, normalizeMonthlyBalances, periodFrom, periodLabel, periodParts } from "../lib/finance-period.mjs";
+import { installmentSummaries } from "../lib/installment-tracking.mjs";
+import { applySavingsHomePurchase, reverseSavingsMovement, savingsHomeOptions, savingsTotals } from "../lib/savings-ledger.mjs";
 
 const money = (value) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value);
-const months = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
+const months = MONTHS;
+const now = new Date();
+const INITIAL_PERIOD = periodFrom(now.getFullYear(), months[now.getMonth()]);
 const localDateKey = () => {
   const date = new Date();
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
@@ -49,7 +55,9 @@ const initialData = {
   theme: "dark",
   sidebarColor: "#173f35",
   navOrder: [],
-  month: "Junho",
+  period: INITIAL_PERIOD,
+  year: periodParts(INITIAL_PERIOD).year,
+  month: periodParts(INITIAL_PERIOD).month,
   homeGroups: [],
   sharedQuotes: [],
   savings: { balance: 0, goal: 0, goalType: "annual", goalMonths: 12, goals: [], completedGoals: [], activeGoalId: null, movements: [], contributions: { Rebeca: 0, Gustavo: 0 } },
@@ -80,18 +88,33 @@ const initialData = {
 const LOCAL_DATA_KEY = "financas-v2";
 const LOCAL_SYNC_KEY = "financas-v2-sync-v2";
 const LOCAL_BACKUPS_KEY = "financas-v2-backups";
-const normalizeFinanceState = (raw={}) => ({
-  ...initialData,
-  ...raw,
-  historyResetVersion:HISTORY_RESET_VERSION,
-  homeGroups:raw.homeGroups||[],
-  sharedQuotes:raw.sharedQuotes||[],
-  savings:{...initialData.savings,...(raw.savings||{}),contributions:{...initialData.savings.contributions,...(raw.savings?.contributions||{})},goals:raw.savings?.goals||[],completedGoals:raw.savings?.completedGoals||[],movements:raw.savings?.movements||[]},
-  users:{
-    Rebeca:{...initialData.users.Rebeca,...(raw.users?.Rebeca||{})},
-    Gustavo:{...initialData.users.Gustavo,...(raw.users?.Gustavo||{})}
-  }
-});
+const normalizeFinanceState = (raw={}) => {
+  const selectedPeriod=raw.period||periodFrom(raw.year||now.getFullYear(),raw.month||initialData.month);
+  const selected=periodParts(selectedPeriod);
+  const normalizeAccount=name=>{
+    const account={...initialData.users[name],...(raw.users?.[name]||{})};
+    return {...account,
+      forecasts:(account.forecasts||[]).map(item=>normalizeItemPeriod(item,selectedPeriod)),
+      transactions:(account.transactions||[]).map(item=>normalizeItemPeriod(item,selectedPeriod)),
+      cards:(account.cards||[]).map(card=>({...card,
+        monthlyBalances:normalizeMonthlyBalances(card.monthlyBalances||{},selected.year),
+        balanceHistory:(card.balanceHistory||[]).map(item=>normalizeItemPeriod(item,selectedPeriod))
+      }))
+    };
+  };
+  return {
+    ...initialData,
+    ...raw,
+    period:selectedPeriod,
+    year:selected.year,
+    month:selected.month,
+    historyResetVersion:HISTORY_RESET_VERSION,
+    homeGroups:raw.homeGroups||[],
+    sharedQuotes:raw.sharedQuotes||[],
+    savings:{...initialData.savings,...(raw.savings||{}),contributions:{...initialData.savings.contributions,...(raw.savings?.contributions||{})},goals:raw.savings?.goals||[],completedGoals:raw.savings?.completedGoals||[],movements:(raw.savings?.movements||[]).map(item=>normalizeItemPeriod(item,selectedPeriod))},
+    users:{Rebeca:normalizeAccount("Rebeca"),Gustavo:normalizeAccount("Gustavo")}
+  };
+};
 const stripSyncHistory = data => {const clean={...data};delete clean._sync;return clean;};
 const stateSummary = data => ({
   Rebeca:{transactions:data.users?.Rebeca?.transactions?.length||0,forecasts:data.users?.Rebeca?.forecasts?.length||0},
@@ -218,15 +241,17 @@ export default function Home() {
         account.cards = (account.cards || []).map(card => {
           const normalized = card.cardType==="benefit"?{...card,cardType:"food"}:card;
           if(normalized.cardType!=="food") return normalized;
-          return {...normalized,monthlyBalances:normalized.monthlyBalances||{[parsed.month]:normalized.initialBalance||normalized.balance||0}};
+          const monthlyBalances=normalizeMonthlyBalances(normalized.monthlyBalances||{},parsed.year);
+          if(!Object.keys(monthlyBalances).length)monthlyBalances[parsed.period]=normalized.initialBalance||normalized.balance||0;
+          return {...normalized,monthlyBalances};
         });
         account.transactions = (account.transactions || []).map(transaction => ({
-          ...transaction,
+          ...normalizeItemPeriod(transaction,parsed.period),
           createdAt: transaction.createdAt || transaction.id,
           date: !transaction.date || transaction.date === "Hoje" ? dateLabel(transaction.createdAt || transaction.id) : transaction.date
         }));
         account.forecasts = (account.forecasts || []).map(forecast => ({
-          ...forecast,
+          ...normalizeItemPeriod(forecast,parsed.period),
           actualConfirmed: forecast.actualConfirmed ?? Boolean(forecast.transactionId)
         }));
         account.alertTemplate ||= defaultAlertTemplate;
@@ -257,6 +282,7 @@ export default function Home() {
         const remote=normalizeFinanceState(row.data);
         const recovered=Object.keys(pendingPatchesRef.current).length?applySyncPatches(remote,pendingPatchesRef.current):remote;
         applyRemoteData(recovered,Object.keys(pendingPatchesRef.current).length?"reconciliação com o Supabase":"atualização recebida do Supabase");
+        mirrorRelationalState(supabase,recovered,session.user.id).catch(()=>{});
         setSyncStatus(Object.keys(pendingPatchesRef.current).length?"pending":"saved");
       }
       else {
@@ -269,6 +295,7 @@ export default function Home() {
         if(createError){setSyncError("Não foi possível criar o espaço compartilhado. A cópia local foi preservada.");setSyncStatus("error");setRemoteLoaded(true);return;}
         pendingPatchesRef.current={};
         persistLocalState(dataRef.current,{});
+        mirrorRelationalState(supabase,dataRef.current,session.user.id).catch(()=>{});
         setSyncStatus("saved");
       }
       setRemoteLoaded(true);
@@ -312,6 +339,7 @@ export default function Home() {
           }
         }
         if(!saved)throw new Error("Conflito ao sincronizar alterações compartilhadas.");
+        await mirrorRelationalState(supabase,merged,session.user.id);
         Object.entries(patchesToSave).forEach(([path,savedPatch])=>{
           if(pendingPatchesRef.current[path]?.revision===savedPatch.revision)delete pendingPatchesRef.current[path];
         });
@@ -348,10 +376,11 @@ export default function Home() {
   if(!session)return <LoginScreen/>;
 
   const user = data.users[data.activeUser];
-  const monthTransactions = user.transactions.filter(t => !t.month || t.month === data.month);
-  const monthForecasts = (user.forecasts || []).filter(f => f.month === data.month);
+  const monthTransactions = user.transactions.filter(t => itemMatchesPeriod(t,data.period,data.period));
+  const monthForecasts = (user.forecasts || []).filter(f => itemMatchesPeriod(f,data.period,data.period));
   const financialMonthForecasts = monthForecasts.filter(forecast => user.cards.find(card=>card.id===forecast.cardId)?.cardType!=="food");
   const financialMonthTransactions = monthTransactions.filter(transaction => {
+    if(transaction.affectsFinancialBalance===false||transaction.savingsOnly)return false;
     if(user.cards.find(card=>card.id===transaction.cardId)?.cardType==="food") return false;
     if(!transaction.linkedForecastId) return true;
     const forecast=(user.forecasts||[]).find(item=>item.id===transaction.linkedForecastId);
@@ -360,20 +389,23 @@ export default function Home() {
   });
   const automaticFixedIncome = financialMonthForecasts.filter(forecast=>forecast.type==="income"&&forecastIsAutomaticFixed(forecast)).reduce((sum,forecast)=>sum+forecast.planned,0);
   const automaticFixedExpenses = financialMonthForecasts.filter(forecast=>forecast.type==="expense"&&forecastIsAutomaticFixed(forecast)).reduce((sum,forecast)=>sum+forecast.planned,0);
+  const paidFixedExpenses = financialMonthForecasts.filter(forecast=>forecast.type==="expense"&&forecastIsAutomaticFixed(forecast)&&fixedExpensePaymentStatus(forecast)==="Pago").reduce((sum,forecast)=>sum+forecast.planned,0);
   const realizedIncome = financialMonthTransactions.filter(t => t.type === "income" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + automaticFixedIncome;
-  const realizedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + automaticFixedExpenses;
+  const realizedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + paidFixedExpenses;
+  const committedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && ["Realizado","Pendente"].includes(t.status)).reduce((s, t) => s + t.amount, 0) + automaticFixedExpenses;
   const plannedIncome = financialMonthForecasts.filter(f => f.type === "income").reduce((s, f) => s + f.planned, 0);
   const plannedExpenses = financialMonthForecasts.filter(f => f.type === "expense").reduce((s, f) => s + f.planned, 0);
   const plan = { income: plannedIncome, expenses: plannedExpenses };
   const balance = realizedIncome - realizedExpenses;
-  const planDiff = plannedExpenses - realizedExpenses;
+  const planDiff = plannedExpenses - committedExpenses;
 
   const update = (patch) => setData(d => ({ ...d, ...patch }));
   const updateUser = (patch) => setData(d => ({ ...d, users: { ...d.users, [d.activeUser]: { ...d.users[d.activeUser], ...patch } } }));
   const changeMonth = (step) => {
-    const current = months.indexOf(data.month);
-    update({ month: months[(current + step + months.length) % months.length] });
+    const period=addMonths(data.period,step),parts=periodParts(period);
+    update({period,month:parts.month,year:parts.year});
   };
+  const changePeriod = period => {const parts=periodParts(period);update({period,month:parts.month,year:parts.year});};
   const savingsPercent = data.savings.goal > 0 ? Math.min(Math.round(data.savings.balance / data.savings.goal * 100), 100) : 0;
   const dueAlerts = (user.alerts || []).filter(alertIsDue);
   const activeAlerts = dueAlerts.length;
@@ -419,10 +451,11 @@ export default function Home() {
         <header>
           <button className="menu-mobile" onClick={() => setMobileOpen(true)}><Menu /></button>
           <div className="period-control">
-            <div className="period-label"><CalendarDays size={18} /><span><small>PERÍODO</small><b>{data.month}</b></span></div>
+            <div className="period-label"><CalendarDays size={18} /><span><small>COMPETÊNCIA</small><b>{periodLabel(data.period,true)}</b></span></div>
             <div className="period-actions">
               <button aria-label="Mês anterior" onClick={() => changeMonth(-1)}><ChevronLeft size={17} /></button>
-              <CustomSelect className="month-select" ariaLabel="Mês selecionado" value={data.month} options={months.map(m=>({value:m,label:m}))} onChange={month=>update({month})}/>
+              <CustomSelect className="month-select" ariaLabel="Mês selecionado" value={data.month} options={months.map(m=>({value:m,label:m}))} onChange={month=>changePeriod(periodFrom(data.year,month))}/>
+              <CustomSelect className="year-select" ariaLabel="Ano selecionado" value={String(data.year)} options={Array.from({length:9},(_,index)=>String(now.getFullYear()-4+index)).map(year=>({value:year,label:year}))} onChange={year=>changePeriod(periodFrom(Number(year),data.month))}/>
               <button aria-label="Próximo mês" onClick={() => changeMonth(1)}><ChevronRight size={17} /></button>
             </div>
           </div>
@@ -443,19 +476,19 @@ export default function Home() {
 
         <div className="content">
           {syncError&&<div className="sync-warning">{syncError}</div>}
-          {page === "Visão geral" && <Dashboard {...{ data, user: {...user, plan, transactions: financialMonthTransactions}, balance, realizedIncome, realizedExpenses, planDiff, savingsPercent, setModal, setPage }} />}
-          {page === "Planejamento" && <Planning {...{ data, setData, user, month: data.month, setModal }} />}
+          {page === "Visão geral" && <Dashboard {...{ data, user: {...user, plan, transactions: financialMonthTransactions}, installmentUser:user, balance, realizedIncome, realizedExpenses, committedExpenses, planDiff, savingsPercent, setModal, setPage }} />}
+          {page === "Planejamento" && <Planning {...{ data, setData, user, month: data.month, period: data.period, setModal }} />}
           {page === "Cotações" && <Quotes {...{ data, setData, setModal }} />}
           {page === "Lançamentos" && <Transactions user={user} setModal={setModal} setData={setData} activeUser={data.activeUser} />}
           {page === "Pessoas" && <People user={user} setData={setData} activeUser={data.activeUser} setModal={setModal} />}
           {page === "Alertas" && <Alerts user={user} setData={setData} activeUser={data.activeUser} setModal={setModal} />}
           {page === "Cofrinho" && <Savings data={data} setData={setData} setModal={setModal} />}
-          {page === "Cartões" && <Cards user={user} setModal={setModal} setData={setData} activeUser={data.activeUser} month={data.month} />}
-          {page === "Nossa Casa" && <HomeChecklist data={data} setData={setData} setModal={setModal} />}
+          {page === "Cartões" && <Cards user={user} setModal={setModal} setData={setData} activeUser={data.activeUser} month={data.month} period={data.period} />}
+          {page === "Nossa Casa" && <HomeChecklist data={data} setData={setData} setModal={setModal} setPage={setPage} />}
           {page === "Configurações" && <SettingsPage data={data} update={update} setData={setData} navItems={navItems} />}
         </div>
       </main>
-      {modal === "monthly-sheet" ? <MonthlySpreadsheetModal data={data} user={user} onClose={() => setModal(null)} /> : modal && <Modal type={modal} onClose={() => setModal(null)} data={data} setData={setData} user={user} />}
+      {modal === "monthly-sheet" ? <MonthlySpreadsheetModal data={data} user={user} onClose={() => setModal(null)} /> : modal === "installment-tracker" ? <InstallmentTrackerModal data={data} user={user} onClose={()=>setModal(null)}/> : modal && <Modal type={modal} onClose={() => setModal(null)} data={data} setData={setData} user={user} />}
     </div>
   );
 }
@@ -524,35 +557,38 @@ function FormSelect({ name, options, defaultValue, value, onChange, ariaLabel, c
   </div>;
 }
 
-function Dashboard({ data, user, balance, realizedIncome, realizedExpenses, planDiff, savingsPercent, setModal, setPage }) {
-  const chartMax = Math.max(user.plan.expenses, realizedExpenses, 1);
-  const monthSavings = (data.savings.movements||[]).filter(m=>m.month===data.month&&m.type==="entry").reduce((sum,m)=>sum+m.amount,0);
+function Dashboard({ data, user, installmentUser, balance, realizedIncome, realizedExpenses, committedExpenses, planDiff, savingsPercent, setModal, setPage }) {
+  const chartMax = Math.max(user.plan.expenses, committedExpenses, realizedExpenses, 1);
+  const trackedInstallments=installmentSummaries(installmentUser,data.period);
+  const monthSavings = (data.savings.movements||[]).filter(m=>itemMatchesPeriod(m,data.period,data.period)&&m.type==="entry").reduce((sum,m)=>sum+m.amount,0);
   const remainingGoal = Math.max((data.savings.goal||0)-data.savings.balance,0);
-  const monthContributions = ["Rebeca","Gustavo"].map(person=>({person,amount:(data.savings.movements||[]).filter(m=>m.month===data.month&&m.type==="entry"&&(m.person===person||m.owner===person)).reduce((sum,m)=>sum+m.amount,0)}));
+  const monthContributions = ["Rebeca","Gustavo"].map(person=>({person,amount:(data.savings.movements||[]).filter(m=>itemMatchesPeriod(m,data.period,data.period)&&m.type==="entry"&&(m.person===person||m.owner===person)).reduce((sum,m)=>sum+m.amount,0)}));
   const fixedCategoryExpenses=(user.forecasts||[])
-    .filter(f=>f.month===data.month&&f.type==="expense"&&forecastIsAutomaticFixed(f)&&user.cards.find(card=>card.id===f.cardId)?.cardType!=="food")
+    .filter(f=>itemMatchesPeriod(f,data.period,data.period)&&f.type==="expense"&&forecastIsAutomaticFixed(f)&&fixedExpensePaymentStatus(f)==="Pago"&&user.cards.find(card=>card.id===f.cardId)?.cardType!=="food")
     .map(f=>({category:f.category,amount:f.planned}));
   return <>
-    <div className="page-title dashboard-welcome"><div><h1>Olá, {data.activeUser}! 👋</h1><p>Aqui está o resumo de {data.month.toLowerCase()}.</p></div>
-      <button className="primary" onClick={() => setModal("transaction")}><Plus size={18} /> Novo lançamento</button>
+    <div className="page-title dashboard-welcome"><div><h1>Olá, {data.activeUser}! 👋</h1><p>Aqui está o resumo de {periodLabel(data.period).toLowerCase()}.</p></div>
+      <div className="title-actions"><button className="installment-header-button" onClick={()=>setModal("installment-tracker")} aria-label="Acompanhar despesas parceladas"><Grid2X2 size={15}/><span>Acompanhamento</span>{trackedInstallments.length>0&&<b>{trackedInstallments.length}</b>}</button><button className="primary" onClick={() => setModal("transaction")}><Plus size={18} /> Novo lançamento</button></div>
     </div>
     <section className="stat-grid">
       <Stat label="Receitas" value={money(realizedIncome)} note={`de ${money(user.plan.income)} previstos`} icon={ArrowUpRight} tone="blue" />
-      <Stat label="Despesas" value={money(realizedExpenses)} note={`de ${money(user.plan.expenses)} previstos`} icon={ArrowDownLeft} tone="coral" />
+      <Stat label="Comprometido" value={money(committedExpenses)} note="obrigações assumidas no período" icon={ReceiptText} tone="gold" />
+      <Stat label="Pago" value={money(realizedExpenses)} note={`de ${money(user.plan.expenses)} planejados`} icon={Check} tone="coral" />
     </section>
     <section className="dashboard-grid">
       <div className="dashboard-column dashboard-main-column">
         <div className="panel spending-panel">
-          <div className="panel-head"><div><span>PLANEJADO X REALIZADO</span><h2>Ritmo de gastos</h2></div><button onClick={() => setPage("Planejamento")}>Ver planejamento</button></div>
+          <div className="panel-head"><div><span>PLANEJADO X COMPROMETIDO X PAGO</span><h2>Ritmo de gastos</h2></div><button onClick={() => setPage("Planejamento")}>Ver planejamento</button></div>
           <div className="expense-bar-chart">
             <div className="chart-scale"><span>{money(chartMax)}</span><span>{money(chartMax/2)}</span><span>R$ 0</span></div>
             <div className="chart-columns">
               <div><span className="chart-value">{money(user.plan.expenses)}</span><i className="planned-column" style={{height:`${user.plan.expenses/chartMax*100}%`}}/><b>Planejado</b></div>
-              <div><span className="chart-value">{money(realizedExpenses)}</span><i className="actual-column" style={{height:`${realizedExpenses/chartMax*100}%`}}/><b>Realizado</b></div>
+              <div><span className="chart-value">{money(committedExpenses)}</span><i className="committed-column" style={{height:`${committedExpenses/chartMax*100}%`}}/><b>Comprometido</b></div>
+              <div><span className="chart-value">{money(realizedExpenses)}</span><i className="actual-column" style={{height:`${realizedExpenses/chartMax*100}%`}}/><b>Pago</b></div>
             </div>
           </div>
           <div className="big-progress">
-            <div className="progress-message"><Sparkles size={18} /><div><b>{planDiff >= 0 ? `Você economizou ${money(planDiff)} até aqui.` : `Atenção: ${money(Math.abs(planDiff))} acima do plano.`}</b><span>{planDiff >= 0 ? "Continue assim — cada escolha está aproximando vocês dos planos." : "Vale revisar as categorias com maior gasto."}</span></div></div>
+            <div className="progress-message"><Sparkles size={18} /><div><b>{planDiff >= 0 ? `Ainda há ${money(planDiff)} livres no planejamento.` : `Atenção: ${money(Math.abs(planDiff))} comprometidos acima do plano.`}</b><span>{money(Math.max(committedExpenses-realizedExpenses,0))} ainda estão comprometidos e pendentes de pagamento.</span></div></div>
           </div>
         </div>
         <div className="panel recent">
@@ -588,7 +624,7 @@ function Stat({ label, value, note, icon: Icon, tone }) {
 
 function TransactionList({ items, onDelete, onAlert }) {
   if (!items.length) return <div className="empty-state"><ReceiptText size={24}/><b>Nenhum lançamento ainda</b><span>Seus registros aparecerão aqui.</span></div>;
-  return <div className="transaction-list">{items.map(t => <div className={`transaction ${onDelete || onAlert ? "deletable" : ""}`} key={t.id}><div className={`tx-icon ${t.type}`} >{t.type === "income" ? <ArrowUpRight /> : <ArrowDownLeft />}</div><div className="tx-name"><b>{t.title}</b><span>{t.category}{t.person && ` • ${t.person}`}{t.card && ` • ${t.card}`}{t.cardPaymentStatus==="Pendente"&&" • Pagamento pendente"}{t.installment && ` • Parcela ${t.installment}`}{t.fixed && " • Fixa"}</span></div><span className="tx-date">{t.date}</span><b className={t.type}>{t.type === "income" ? "+" : "−"} {money(t.amount)}</b>{onAlert && <button className="alert-transaction-button" aria-label={`Criar alerta para ${t.title}`} title="Criar alerta" onClick={() => onAlert(t)}><Bell size={15}/></button>}{onDelete && <button className="delete-button" aria-label={`Excluir ${t.title}`} onClick={() => onDelete(t)}><Trash2 size={16}/></button>}</div>)}</div>;
+  return <div className="transaction-list">{items.map(t => <div className={`transaction ${onDelete || onAlert ? "deletable" : ""} ${t.savingsOnly?"savings-only":""}`} key={t.id}><div className={`tx-icon ${t.savingsOnly?"savings":t.type}`} >{t.savingsOnly?<PiggyBank/>:t.type === "income" ? <ArrowUpRight /> : <ArrowDownLeft />}</div><div className="tx-name"><b>{t.title}</b><span>{t.category}{t.person && ` • ${t.person}`}{t.card && ` • ${t.card}`}{t.cardPaymentStatus==="Pendente"&&" • Pagamento pendente"}{t.installment && ` • Parcela ${t.installment}`}{t.fixed && " • Fixa"}{t.savingsOnly&&" • Pago pelo Cofrinho • Não afeta o saldo mensal"}</span></div><span className="tx-date">{t.date}</span><b className={t.savingsOnly?"savings-neutral":t.type}>{t.savingsOnly?"Cofrinho":t.type === "income" ? "+" : "−"} {money(t.amount)}</b>{onAlert&&!t.savingsOnly && <button className="alert-transaction-button" aria-label={`Criar alerta para ${t.title}`} title="Criar alerta" onClick={() => onAlert(t)}><Bell size={15}/></button>}{onDelete && <button className="delete-button" aria-label={`Excluir ${t.title}`} onClick={() => onDelete(t)}><Trash2 size={16}/></button>}</div>)}</div>;
 }
 
 function CategoryPie({ transactions, fixedExpenses=[] }) {
@@ -632,14 +668,16 @@ function FinanceFilters({ search, setSearch, person, setPerson, type, setType, c
   </div>;
 }
 
-function Planning({ data, setData, user, setModal, month }) {
-  const monthForecasts = (user.forecasts || []).filter(f=>f.month===month);
-  const unplanned = user.transactions.filter(t => t.month === month && t.unplanned && user.cards.find(c=>c.id===t.cardId)?.cardType!=="food");
+function Planning({ data, setData, user, setModal, month, period }) {
+  const monthForecasts = (user.forecasts || []).filter(f=>itemMatchesPeriod(f,period,period));
+  const trackedInstallments=installmentSummaries(user,period);
+  const unplanned = user.transactions.filter(t => itemMatchesPeriod(t,period,period) && t.unplanned && t.affectsFinancialBalance!==false && !t.savingsOnly && user.cards.find(c=>c.id===t.cardId)?.cardType!=="food");
   const financialForecasts = monthForecasts.filter(f=>user.cards.find(c=>c.id===f.cardId)?.cardType!=="food");
   const plannedIncome = financialForecasts.filter(f => f.type === "income").reduce((s,f)=>s+f.planned,0);
   const plannedExpenses = financialForecasts.filter(f => f.type === "expense").reduce((s,f)=>s+f.planned,0);
   const actualIncome = financialForecasts.filter(f => f.type === "income" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="income"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
-  const actualExpenses = financialForecasts.filter(f => f.type === "expense" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
+  const actualExpenses = financialForecasts.filter(f => f.type === "expense" && ((forecastIsAutomaticFixed(f)&&fixedExpensePaymentStatus(f)==="Pago")||(!forecastIsAutomaticFixed(f)&&forecastIsConfirmed(f)))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
+  const committedExpenses = financialForecasts.filter(f=>f.type==="expense"&&(forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&["Realizado","Pendente"].includes(t.status)).reduce((s,t)=>s+t.amount,0);
   const plannedTotal = plannedIncome - plannedExpenses;
   const actualTotal = actualIncome - actualExpenses;
   const leftover = actualIncome - actualExpenses;
@@ -672,10 +710,11 @@ function Planning({ data, setData, user, setModal, month }) {
     const current = account.forecasts.find(f=>f.id===forecast.id);
     if(!current || current.actual==null || forecastIsConfirmed(current)) return d;
     const txId=Date.now(), linkedCard=account.cards.find(c=>c.id===current.cardId);
-    const transaction={id:txId,createdAt:txId,linkedForecastId:current.id,type:current.type,title:current.description,category:current.category,personId:current.personId,person:current.person,cardId:current.cardId||null,card:current.card||"",amount:current.actual,date:dateLabel(),month:current.month,status:"Realizado",source:"Planejamento",cardPaymentStatus:linkedCard?.cardType==="credit"&&current.type==="expense"?"Pendente":"Pago"};
+    const transaction={id:txId,createdAt:txId,linkedForecastId:current.id,type:current.type,title:current.description,category:current.category,personId:current.personId,person:current.person,cardId:current.cardId||null,card:current.card||"",amount:current.actual,date:dateLabel(),period:current.period,year:current.year,month:current.month,status:"Realizado",source:current.source||"Planejamento",cardPaymentStatus:linkedCard?.cardType==="credit"&&current.type==="expense"?"Pendente":"Pago",quoteId:current.quoteId||null,quoteItemId:current.quoteItemId||null,homeGroupId:current.homeGroupId||null,homeItemId:current.homeItemId||null,installmentSeriesId:current.installmentSeriesId||null,installment:current.installment||null,installmentIndex:current.installmentIndex||null,installmentCount:current.installmentCount||null,seriesTotal:current.seriesTotal||null};
     const forecasts=account.forecasts.map(f=>f.id===current.id?{...f,actualConfirmed:true,transactionId:txId}:f);
     const cards=account.cards.map(card=>card.id===current.cardId?adjustCard(card,current.type,current.actual,1):card);
-    return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts,transactions:[transaction,...account.transactions],cards}}};
+    const homeGroups=current.homeItemId?(d.homeGroups||[]).map(group=>group.id===current.homeGroupId?{...group,items:group.items.map(item=>item.id===current.homeItemId?{...item,status:"Comprado",transactionId:txId}:item)}:group):d.homeGroups;
+    return {...d,homeGroups,users:{...d.users,[d.activeUser]:{...account,forecasts,transactions:[transaction,...account.transactions],cards}}};
   });
 
   const reopenActual = (forecast) => setData(d => {
@@ -683,13 +722,18 @@ function Planning({ data, setData, user, setModal, month }) {
     if(!current || !forecastIsConfirmed(current)) return d;
     const cards=account.cards.map(card=>card.id===current.cardId?adjustCard(card,current.type,current.actual||0,-1):card);
     const forecasts=account.forecasts.map(f=>f.id===current.id?{...f,actualConfirmed:false,transactionId:null}:f);
-    return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts,transactions:account.transactions.filter(t=>t.id!==current.transactionId),cards}}};
+    const homeGroups=current.homeItemId?(d.homeGroups||[]).map(group=>group.id===current.homeGroupId?{...group,items:group.items.map(item=>item.id===current.homeItemId?{...item,status:"Em cotação",transactionId:null}:item)}:group):d.homeGroups;
+    return {...d,homeGroups,users:{...d.users,[d.activeUser]:{...account,forecasts,transactions:account.transactions.filter(t=>t.id!==current.transactionId),cards}}};
   });
 
   const removeForecast = (forecast) => setData(d => {
     const account = d.users[d.activeUser];
+    const forecasts=account.forecasts.filter(f=>f.id!==forecast.id);
+    const remainingLink=forecast.quoteItemId?forecasts.find(item=>item.quoteId===forecast.quoteId&&item.quoteItemId===forecast.quoteItemId):null;
     const cards=account.cards.map(c=>c.id===forecast.cardId&&forecastIsConfirmed(forecast)?adjustCard(c,forecast.type,forecast.actual||0,-1):c);
-    return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts:account.forecasts.filter(f=>f.id!==forecast.id),transactions:account.transactions.filter(t=>t.id!==forecast.transactionId),cards}}};
+    const sharedQuotes=forecast.quoteItemId?(d.sharedQuotes||[]).map(quote=>quote.id===forecast.quoteId?{...quote,items:quote.items.map(item=>item.id===forecast.quoteItemId?{...item,forecastId:remainingLink?.id||null,forecastOwner:remainingLink?d.activeUser:null}:item)}:quote):d.sharedQuotes;
+    const homeGroups=forecast.homeItemId&&!remainingLink?(d.homeGroups||[]).map(group=>group.id===forecast.homeGroupId?{...group,items:group.items.map(item=>item.id===forecast.homeItemId?{...item,status:"Em cotação",transactionId:null}:item)}:group):d.homeGroups;
+    return {...d,sharedQuotes,homeGroups,users:{...d.users,[d.activeUser]:{...account,forecasts,transactions:account.transactions.filter(t=>t.id!==forecast.transactionId),cards}}};
   });
 
   const reorderForecast = (draggedId,targetId) => setData(d=>{
@@ -704,13 +748,16 @@ function Planning({ data, setData, user, setModal, month }) {
 
   const toggleFixedPaymentStatus = (forecast) => setData(d=>{
     const account=d.users[d.activeUser];
-    const forecasts=account.forecasts.map(item=>item.id===forecast.id?{...item,fixedPaymentStatus:toggleFixedExpensePaymentStatus(item)}:item);
-    return {...d,users:{...d.users,[d.activeUser]:{...account,forecasts}}};
+    const nextStatus=toggleFixedExpensePaymentStatus(forecast);
+    const forecasts=account.forecasts.map(item=>item.id===forecast.id?{...item,fixedPaymentStatus:nextStatus}:item);
+    const homeGroups=forecast.homeItemId?(d.homeGroups||[]).map(group=>group.id===forecast.homeGroupId?{...group,items:group.items.map(item=>item.id===forecast.homeItemId?{...item,status:nextStatus==="Pago"?"Comprado":"Em cotação"}:item)}:group):d.homeGroups;
+    return {...d,homeGroups,users:{...d.users,[d.activeUser]:{...account,forecasts}}};
   });
 
   return <>
-    <PageTitle eyebrow="ORGANIZE ANTES DE GASTAR" title={`Planejamento de ${month}`} subtitle="Sua previsão mensal em formato de planilha, com o realizado ao lado.">
+    <PageTitle eyebrow="ORGANIZE ANTES DE GASTAR" title={`Planejamento de ${periodLabel(period)}`} subtitle="Sua previsão mensal em formato de planilha, separando valores comprometidos e pagos.">
       <div className="planning-title-actions">
+        <button className="installment-header-button" onClick={()=>setModal("installment-tracker")} aria-label="Acompanhar despesas parceladas"><Grid2X2 size={15}/><span>Acompanhamento</span>{trackedInstallments.length>0&&<b>{trackedInstallments.length}</b>}</button>
         <button className="monthly-sheet-button" onClick={() => setModal("monthly-sheet")}><Grid2X2 size={17}/><span>Planilha do mês</span></button>
         <button className="primary" onClick={() => setModal("forecast")}><Plus size={18}/> Adicionar previsão</button>
       </div>
@@ -718,7 +765,9 @@ function Planning({ data, setData, user, setModal, month }) {
     <section className="planning-hero">
       <div><span>SALDO PREVISTO</span><strong>{money(plannedTotal)}</strong><small>receitas menos despesas</small></div>
       <div className="vertical-rule" />
-      <div><span>SALDO REALIZADO</span><strong>{money(actualTotal)}</strong><small>somente valores concluídos</small></div>
+      <div><span>COMPROMETIDO</span><strong>{money(committedExpenses)}</strong><small>obrigações assumidas no período</small></div>
+      <div className="vertical-rule" />
+      <div><span>PAGO</span><strong>{money(actualExpenses)}</strong><small>valores efetivamente quitados</small></div>
       <div className="vertical-rule" />
       <div className={leftover >= 0 ? "positive" : "negative"}><span>SOBROU</span><strong>{leftover < 0 ? "− " : ""}{money(Math.abs(leftover))}</strong><small>{leftover >= 0 ? "receitas menos despesas do mês" : "despesas acima das receitas"}</small></div>
     </section>
@@ -739,11 +788,11 @@ function MonthlySpreadsheetModal({data,user,onClose}){
     income:{search:"",category:"",source:""},
     expense:{search:"",category:"",source:""}
   });
-  const monthForecasts=(user.forecasts||[]).filter(f=>f.month===data.month);
-  const unplanned=(user.transactions||[]).filter(t=>t.month===data.month&&t.unplanned&&user.cards.find(card=>card.id===t.cardId)?.cardType!=="food");
+  const monthForecasts=(user.forecasts||[]).filter(f=>itemMatchesPeriod(f,data.period,data.period));
+  const unplanned=(user.transactions||[]).filter(t=>itemMatchesPeriod(t,data.period,data.period)&&t.unplanned&&t.affectsFinancialBalance!==false&&!t.savingsOnly&&user.cards.find(card=>card.id===t.cardId)?.cardType!=="food");
   const forecastRows=monthForecasts.map(f=>{
-    const automatic=forecastIsAutomaticFixed(f),realized=automatic||forecastIsConfirmed(f),benefit=user.cards.find(card=>card.id===f.cardId)?.cardType==="food";
-    return {id:`forecast-${f.id}`,type:f.type,description:f.description,category:f.category,source:`${automatic?"Fixo automático":"Planejado"}${benefit?" • Benefício":""}`,value:realized?(automatic?f.planned:(f.actual||0)):null,countsInTotals:!benefit};
+    const automatic=forecastIsAutomaticFixed(f),paid=automatic?(f.type==="income"||fixedExpensePaymentStatus(f)==="Pago"):forecastIsConfirmed(f),benefit=user.cards.find(card=>card.id===f.cardId)?.cardType==="food";
+    return {id:`forecast-${f.id}`,type:f.type,description:f.description,category:f.category,source:`${automatic?`Fixo • ${f.type==="expense"?fixedExpensePaymentStatus(f):"Automático"}`:"Planejado"}${benefit?" • Benefício":""}`,value:paid?(automatic?f.planned:(f.actual||0)):null,countsInTotals:!benefit};
   });
   const unplannedRows=unplanned.map(t=>({id:`transaction-${t.id}`,type:t.type,description:t.title,category:t.category,source:"Fora do planejado",value:t.status==="Realizado"?t.amount:null,countsInTotals:true}));
   const rows=[...forecastRows,...unplannedRows];
@@ -779,7 +828,7 @@ function MonthlySpreadsheetModal({data,user,onClose}){
   return <div className="modal-backdrop monthly-sheet-backdrop" onMouseDown={event=>event.target===event.currentTarget&&onClose()}>
     <div className="monthly-sheet-modal" role="dialog" aria-modal="true" aria-labelledby="monthly-sheet-title">
       <button className="modal-close" aria-label="Fechar planilha do mês" onClick={onClose}><X/></button>
-      <div className="monthly-sheet-title"><span>VISÃO SOMENTE LEITURA</span><h2 id="monthly-sheet-title">Planilha de {data.month}</h2><p>Selecione as células de valores para conferir créditos e débitos.</p></div>
+      <div className="monthly-sheet-title"><span>VISÃO SOMENTE LEITURA</span><h2 id="monthly-sheet-title">Planilha de {periodLabel(data.period)}</h2><p>Selecione as células de valores para conferir créditos e débitos pagos.</p></div>
       <div className="monthly-sheet-totals">
         <div className="income"><span>Total de receitas</span><b>{money(totalIncome)}</b></div>
         <div className="expense"><span>Total de despesas</span><b>{money(totalExpenses)}</b></div>
@@ -791,6 +840,27 @@ function MonthlySpreadsheetModal({data,user,onClose}){
       </div>
       <div className="monthly-sheet-groups">{renderGroup("Receitas","income",incomes)}{renderGroup("Despesas","expense",expenses)}</div>
     </div>
+  </div>;
+}
+
+function InstallmentTrackerModal({data,user,onClose}){
+  const summaries=installmentSummaries(user,data.period);
+  const totals=summaries.reduce((result,item)=>({total:result.total+item.total,paid:result.paid+item.paid,pending:result.pending+item.pending}),{total:0,paid:0,pending:0});
+  return <div className="modal-backdrop installment-tracker-backdrop" onMouseDown={event=>event.target===event.currentTarget&&onClose()}>
+    <section className="installment-tracker-modal" role="dialog" aria-modal="true" aria-labelledby="installment-tracker-title">
+      <button className="modal-close" aria-label="Fechar acompanhamento de parcelas" onClick={onClose}><X/></button>
+      <div className="installment-tracker-title"><span>ACOMPANHAMENTO</span><h2 id="installment-tracker-title">Despesas parceladas</h2><p>Visão consolidada das compras parceladas em {periodLabel(data.period).toLowerCase()}.</p></div>
+      <div className="installment-overview">
+        <div><small>VALOR TOTAL</small><b>{money(totals.total)}</b></div>
+        <div className="paid"><small>JÁ PAGO</small><b>{money(totals.paid)}</b></div>
+        <div className="pending"><small>PENDENTE</small><b>{money(totals.pending)}</b></div>
+      </div>
+      {summaries.length?<div className="installment-tracker-list">{summaries.map(item=><article className="installment-tracker-row" key={item.id}>
+        <div className="installment-copy"><span><b>{item.description}</b><small>{item.category}{item.person?` • ${item.person}`:""}{item.card?` • ${item.card}`:""}</small></span><i>{item.currentInstallment?`Parcela ${item.currentInstallment} de ${item.count} nesta competência`:`Sem parcela em ${periodLabel(data.period,true)}`}</i></div>
+        <div className="installment-values"><span><small>Pago</small><b>{money(item.paid)}</b></span><span><small>Pendente</small><b>{money(item.pending)}</b></span></div>
+        <div className="installment-progress"><span><i style={{width:`${item.percent}%`}}/></span><b>{item.percent}%</b><small>{item.paidCount} de {item.count} parcelas pagas</small></div>
+      </article>)}</div>:<div className="empty-state large installment-empty"><Grid2X2 size={29}/><b>Nenhuma despesa parcelada</b><span>Parcelamentos criados em Planejamento ou Lançamentos aparecerão aqui automaticamente.</span></div>}
+    </section>
   </div>;
 }
 
@@ -842,14 +912,13 @@ function Transactions({ user, setModal, setData, activeUser }) {
     && (!status || t.status===status))
     .sort((a,b)=>transactionTimestamp(b)-transactionTimestamp(a));
   const removeTransaction = (transaction) => setData(d => {
+    if(transaction.savingsMovementId)return reverseSavingsMovement(d,transaction.savingsMovementId);
     const account = d.users[activeUser];
-    const movement = transaction.savingsMovementId ? d.savings.movements.find(m=>m.id===transaction.savingsMovementId) : null;
-    const savings = movement ? {...d.savings,balance:d.savings.balance+movement.amount,movements:d.savings.movements.filter(m=>m.id!==movement.id)} : d.savings;
     const cards = account.cards.map(c=>c.id===transaction.cardId&&transaction.status==="Realizado"?adjustCard(c,transaction.type,transaction.amount,-1):c);
     return {...d,users:{...d.users,[activeUser]:{...account,
       transactions:account.transactions.filter(t=>t.id!==transaction.id),
       forecasts:(account.forecasts || []).map(f=>f.transactionId===transaction.id?{...f,actual:null,actualConfirmed:false,transactionId:null}:f),cards
-    }},savings};
+    }}};
   });
   return <>
     <PageTitle eyebrow="ENTRADAS E SAÍDAS" title="Lançamentos" subtitle="Tudo o que aconteceu com seu dinheiro, em um só lugar.">
@@ -896,7 +965,7 @@ function Quotes({ data, setData, setModal }) {
       </aside>
       {selected&&<section className="panel quote-detail">
         <div className="quote-detail-head"><div><span>{selectedCompleted?"COTAÇÃO CONCLUÍDA":"COTAÇÃO EM ANDAMENTO"}</span>{editingSubject?<div className="quote-subject-edit"><input aria-label="Editar nome da cotação" value={subjectDraft} onChange={e=>setSubjectDraft(e.target.value)}/><button onClick={saveSubject}><Check size={16}/></button><button onClick={()=>setEditingSubject(false)}><X size={16}/></button></div>:<div className="quote-title-row"><h2>{selected.subject}</h2>{!selectedCompleted&&<button className="edit-button" aria-label={`Editar cotação ${selected.subject}`} onClick={()=>{setSubjectDraft(selected.subject);setEditingSubject(true);}}><Edit3 size={15}/></button>}</div>}<p>{selected.items.length} {selected.items.length===1?"opção cotada":"opções cotadas"}</p></div>{selectedCompleted?<button className="reopen-quote-button" onClick={()=>reopenQuote(selected.id)}>Reabrir cotação</button>:<button className="close-quote-button" onClick={()=>closeQuote(selected.id)}><Check size={16}/> Encerrar cotação</button>}</div>
-        <div className="quote-checklist">{selected.items.map(item=>{const itemStatus=normalizeQuoteItemStatus(item);return editingItemId===item.id?<div className="quote-item-edit" key={item.id}><input aria-label="Editar item da cotação" value={itemDraft.name} onChange={e=>setItemDraft(d=>({...d,name:e.target.value}))}/><input aria-label="Editar valor do item" type="number" min="0" step="0.01" value={itemDraft.value} onChange={e=>setItemDraft(d=>({...d,value:e.target.value}))}/><input aria-label="Editar link do item" type="url" value={itemDraft.link} onChange={e=>setItemDraft(d=>({...d,link:e.target.value}))}/><button className="edit-button" aria-label={`Salvar item ${item.name}`} onClick={saveItem}><Check size={16}/></button><button className="delete-button" aria-label="Cancelar edição do item" onClick={()=>setEditingItemId(null)}><X size={16}/></button></div>:<div className={`quote-item ${itemStatusClass(itemStatus)}`} key={item.id}><button className={`quote-item-status ${itemStatusClass(itemStatus)}`} disabled={selectedCompleted} aria-label={`${item.name}: ${itemStatus}. Clique para alterar o status`} title={selectedCompleted?"Reabra a cotação para alterar":"Clique para alterar o status"} onClick={()=>toggleItemStatus(selected.id,item.id)}>{itemStatusIcon(itemStatus)}<span>{itemStatus}</span></button><span><b>{item.name}</b><small>{money(item.value||0)}</small>{item.link&&<a href={item.link.startsWith("http")?item.link:`https://${item.link}`} target="_blank" rel="noreferrer"><ExternalLink size={13}/> Abrir referência</a>}</span>{!selectedCompleted&&<div className="quote-item-actions"><button className="edit-button" aria-label={`Editar item ${item.name}`} onClick={()=>startItemEdit(item)}><Edit3 size={15}/></button><button className="delete-button" aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(selected.id,item.id)}><Trash2 size={15}/></button></div>}</div>})}</div>
+        <div className="quote-checklist">{selected.items.map(item=>{const itemStatus=normalizeQuoteItemStatus(item);return editingItemId===item.id?<div className="quote-item-edit" key={item.id}><input aria-label="Editar item da cotação" value={itemDraft.name} onChange={e=>setItemDraft(d=>({...d,name:e.target.value}))}/><input aria-label="Editar valor do item" type="number" min="0" step="0.01" value={itemDraft.value} onChange={e=>setItemDraft(d=>({...d,value:e.target.value}))}/><input aria-label="Editar link do item" type="url" value={itemDraft.link} onChange={e=>setItemDraft(d=>({...d,link:e.target.value}))}/><button className="edit-button" aria-label={`Salvar item ${item.name}`} onClick={saveItem}><Check size={16}/></button><button className="delete-button" aria-label="Cancelar edição do item" onClick={()=>setEditingItemId(null)}><X size={16}/></button></div>:<div className={`quote-item ${itemStatusClass(itemStatus)}`} key={item.id}><button className={`quote-item-status ${itemStatusClass(itemStatus)}`} disabled={selectedCompleted} aria-label={`${item.name}: ${itemStatus}. Clique para alterar o status`} title={selectedCompleted?"Reabra a cotação para alterar":"Clique para alterar o status"} onClick={()=>toggleItemStatus(selected.id,item.id)}>{itemStatusIcon(itemStatus)}<span>{itemStatus}</span></button><span><b>{item.name}</b><small>{money(item.value||0)}</small>{item.link&&<a href={item.link.startsWith("http")?item.link:`https://${item.link}`} target="_blank" rel="noreferrer"><ExternalLink size={13}/> Abrir referência</a>}{item.forecastId&&<i className="quote-linked-label"><ReceiptText size={12}/> No planejamento</i>}</span><div className="quote-item-actions">{itemStatus==="Escolhida"&&!item.forecastId&&<button className="quote-plan-button" aria-label={`Planejar compra de ${item.name}`} title="Adicionar ao planejamento" onClick={()=>setModal(`forecast-from-quote:${selected.id}:${item.id}`)}><ReceiptText size={15}/></button>}{!selectedCompleted&&<><button className="edit-button" aria-label={`Editar item ${item.name}`} onClick={()=>startItemEdit(item)}><Edit3 size={15}/></button><button className="delete-button" aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(selected.id,item.id)}><Trash2 size={15}/></button></>}</div></div>})}</div>
         {!selected.items.length&&<div className="empty-state compact"><ClipboardList size={24}/><b>Nenhuma opção adicionada</b><span>Adicione abaixo a primeira opção desta cotação.</span></div>}
         {!selectedCompleted&&<form className="quote-add-form" onSubmit={addItem}><label>O que está sendo cotado?<input required name="item" placeholder="Ex.: Sofá para a sala"/></label><label>Valor<input required name="value" type="number" min="0" step="0.01" placeholder="0,00"/></label><label>Link de referência <small>(opcional)</small><div className="link-input"><Link2 size={15}/><input name="link" type="url" placeholder="https://loja.com/produto"/></div></label><button className="secondary" type="submit"><Plus size={16}/> Adicionar opção</button></form>}
       </section>}
@@ -904,7 +973,7 @@ function Quotes({ data, setData, setModal }) {
   </>;
 }
 
-function HomeChecklist({data,setData,setModal}){
+function HomeChecklist({data,setData,setModal,setPage}){
   const groups=data.homeGroups||[];
   const [openId,setOpenId]=useState(groups[0]?.id||null);
   const updateGroups=updater=>setData(d=>({...d,homeGroups:updater(d.homeGroups||[])}));
@@ -916,9 +985,17 @@ function HomeChecklist({data,setData,setModal}){
     updateGroups(list=>list.map(group=>group.id===groupId?{...group,items:[...group.items,item]}:group));
     form.reset();
   };
-  const setStatus=(groupId,itemId,status)=>updateGroups(list=>list.map(group=>group.id===groupId?{...group,items:group.items.map(item=>item.id===itemId?{...item,status}:item)}:group));
-  const removeItem=(groupId,itemId)=>updateGroups(list=>list.map(group=>group.id===groupId?{...group,items:group.items.filter(item=>item.id!==itemId)}:group));
-  const removeGroup=groupId=>{updateGroups(list=>list.filter(group=>group.id!==groupId));if(openId===groupId)setOpenId(null);};
+  const setStatus=(groupId,itemId,status)=>updateGroups(list=>list.map(group=>group.id===groupId?{...group,items:group.items.map(item=>item.id===itemId&&!item.savingsMovementId?{...item,status}:item)}:group));
+  const createQuote=(group,item)=>{
+    const quoteId=Date.now();
+    setData(d=>({...d,
+      sharedQuotes:[{id:quoteId,subject:item.name,status:"Em andamento",homeGroupId:group.id,homeItemId:item.id,items:[]},...(d.sharedQuotes||[])],
+      homeGroups:(d.homeGroups||[]).map(current=>current.id===group.id?{...current,items:current.items.map(entry=>entry.id===item.id?{...entry,status:"Em cotação",quoteId}:entry)}:current)
+    }));
+    setPage("Cotações");
+  };
+  const removeItem=(groupId,itemId)=>updateGroups(list=>list.map(group=>group.id===groupId?{...group,items:group.items.filter(item=>item.id!==itemId||item.savingsMovementId)}:group));
+  const removeGroup=groupId=>{updateGroups(list=>list.filter(group=>group.id!==groupId||group.items.some(item=>item.savingsMovementId)));if(openId===groupId)setOpenId(null);};
   const totals=groups.reduce((result,group)=>{group.items.forEach(item=>result[item.status]=(result[item.status]||0)+1);return result;},{"Pendente":0,"Em cotação":0,"Comprado":0});
   return <>
     <PageTitle eyebrow="PLANOS PARA O LAR" title="Nossa Casa" subtitle="">
@@ -930,14 +1007,15 @@ function HomeChecklist({data,setData,setModal}){
     {groups.length?<div className="home-groups">{groups.map(group=>{const open=openId===group.id,done=group.items.filter(item=>item.status==="Comprado").length;return <section className={`panel home-group ${open?"open":""}`} key={group.id}>
       <div className="home-group-head">
         <button className="home-group-toggle" onClick={()=>setOpenId(open?null:group.id)}><span><House size={18}/><i><b>{group.name}</b><small>{done} de {group.items.length} comprados</small></i></span><ChevronDown size={18}/></button>
-        <button className="delete-button" aria-label={`Excluir grupo ${group.name}`} onClick={()=>removeGroup(group.id)}><Trash2 size={16}/></button>
+        <button className="delete-button" disabled={group.items.some(item=>item.savingsMovementId)} title={group.items.some(item=>item.savingsMovementId)?"Exclua primeiro o lançamento do Cofrinho":"Excluir grupo"} aria-label={`Excluir grupo ${group.name}`} onClick={()=>removeGroup(group.id)}><Trash2 size={16}/></button>
       </div>
       {open&&<div className="home-group-content">
         <div className="home-items">{group.items.map(item=><div className={`home-item ${item.status==="Comprado"?"bought":""}`} key={item.id}>
-          <button className="home-check" aria-label={`${item.status==="Comprado"?"Desmarcar":"Marcar como comprado"} ${item.name}`} onClick={()=>setStatus(group.id,item.id,item.status==="Comprado"?"Pendente":"Comprado")}>{item.status==="Comprado"&&<Check size={15}/>}</button>
-          <span><b>{item.name}</b><small>{item.status}</small></span>
-          <CustomSelect className={`home-status ${item.status==="Comprado"?"bought":item.status==="Em cotação"?"quoting":""}`} ariaLabel={`Status de ${item.name}`} value={item.status} onChange={status=>setStatus(group.id,item.id,status)} options={["Pendente","Em cotação","Comprado"].map(status=>({value:status,label:status}))}/>
-          <button className="delete-button" aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(group.id,item.id)}><Trash2 size={15}/></button>
+          <button className="home-check" disabled={Boolean(item.savingsMovementId)} aria-label={`${item.status==="Comprado"?"Desmarcar":"Marcar como comprado"} ${item.name}`} onClick={()=>setStatus(group.id,item.id,item.status==="Comprado"?"Pendente":"Comprado")}>{item.status==="Comprado"&&<Check size={15}/>}</button>
+          <span><b>{item.name}</b><small>{item.status}{item.savingsMovementId?" • Pago pelo Cofrinho":""}</small></span>
+          {item.savingsMovementId?<span className="home-savings-badge"><PiggyBank size={13}/> Cofrinho</span>:<CustomSelect className={`home-status ${item.status==="Comprado"?"bought":item.status==="Em cotação"?"quoting":""}`} ariaLabel={`Status de ${item.name}`} value={item.status} onChange={status=>setStatus(group.id,item.id,status)} options={["Pendente","Em cotação","Comprado"].map(status=>({value:status,label:status}))}/>} 
+          {!item.quoteId&&item.status!=="Comprado"&&<button className="home-quote-button" aria-label={`Criar cotação para ${item.name}`} title="Criar cotação" onClick={()=>createQuote(group,item)}><ClipboardList size={15}/></button>}
+          <button className="delete-button" disabled={Boolean(item.savingsMovementId)} title={item.savingsMovementId?"Exclua primeiro o lançamento do Cofrinho":"Excluir item"} aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(group.id,item.id)}><Trash2 size={15}/></button>
         </div>)}</div>
         {!group.items.length&&<div className="empty-state compact"><House size={24}/><b>Grupo vazio</b><span>Adicione abaixo o primeiro item para a casa.</span></div>}
         <form className="home-add-item" onSubmit={e=>addItem(e,group.id)}><label>Novo item<input required name="item" placeholder="Ex.: Mesa de jantar"/></label><button className="secondary" type="submit"><Plus size={16}/> Adicionar</button></form>
@@ -974,22 +1052,25 @@ function Alerts({ user, setData, activeUser, setModal }) {
 
 function Savings({ data, setData, setModal }) {
   const [statementMode,setStatementMode]=useState("total");
-  const [statementMonth,setStatementMonth]=useState(data.month);
+  const [statementMonth,setStatementMonth]=useState(data.period);
   const goals = data.savings.goals || [];
   const completedGoals = [...(data.savings.completedGoals || [])].sort((a,b)=>(b.completedAt||0)-(a.completedAt||0));
   const activeGoal = goals.find(g=>g.id===data.savings.activeGoalId) || goals[0] || null;
-  const percent = data.savings.goal > 0 ? Math.min(Math.round(data.savings.balance/data.savings.goal*100), 100) : 0;
+  const goalAmount=activeGoal?.amount||0;
+  const percent = goalAmount > 0 ? Math.min(Math.round(data.savings.balance/goalAmount*100), 100) : 0;
+  const savingsLedger=savingsTotals(data.savings);
   const activeGoalMonthCount = activeGoal?.selectedMonths?.length || activeGoal?.months || 12;
   const monthlyTarget = activeGoal ? activeGoal.amount / (activeGoal.type === "monthly" ? activeGoalMonthCount : 12) : 0;
-  const monthStatement = data.savings.movements.filter(m => m.month === data.month);
-  const statement = data.savings.movements.filter(m=>statementMode==="total"||m.month===statementMonth).sort((a,b)=>b.id-a.id);
+  const monthStatement = data.savings.movements.filter(m => itemMatchesPeriod(m,data.period,data.period));
+  const statementPeriods=[...new Set([data.period,...data.savings.movements.map(item=>normalizeItemPeriod(item,data.period).period)])].sort().reverse();
+  const statement = data.savings.movements.filter(m=>statementMode==="total"||itemMatchesPeriod(m,statementMonth,data.period)).sort((a,b)=>b.id-a.id);
   const monthEntries = monthStatement.filter(m=>m.type==="entry").reduce((s,m)=>s+m.amount,0);
   const monthWithdrawals = monthStatement.filter(m=>m.type==="withdrawal").reduce((s,m)=>s+m.amount,0);
   const statementEntries = statement.filter(m=>m.type==="entry").reduce((s,m)=>s+m.amount,0);
   const statementWithdrawals = statement.filter(m=>m.type==="withdrawal").reduce((s,m)=>s+m.amount,0);
   const add = (e) => {
     e.preventDefault(); const amount = +new FormData(e.currentTarget).get("amount"); if (!amount) return;
-    const movement={id:Date.now(),type:"entry",amount,description:`Contribuição de ${data.activeUser}`,person:data.activeUser,owner:data.activeUser,month:data.month,date:"Hoje"};
+    const movement={id:Date.now(),type:"entry",amount,description:`Contribuição de ${data.activeUser}`,person:data.activeUser,owner:data.activeUser,period:data.period,year:data.year,month:data.month,date:"Hoje"};
     setData(d => ({...d, savings: {...d.savings, balance: d.savings.balance+amount,movements:[movement,...d.savings.movements], contributions: {...d.savings.contributions, [d.activeUser]: d.savings.contributions[d.activeUser]+amount}}}));
     e.currentTarget.reset();
   };
@@ -1004,31 +1085,31 @@ function Savings({ data, setData, setModal }) {
       const goal=(d.savings.goals||[]).find(item=>item.id===activeGoal.id);
       if(!goal || d.savings.balance<goal.amount)return d;
       const remainingGoals=(d.savings.goals||[]).filter(item=>item.id!==goal.id),nextGoal=remainingGoals[0]||null;
-      const achievement={...goal,completedAt,completedDate,completedMonth:d.month,completedBy:d.activeUser,achievedAmount:d.savings.balance};
+      const achievement={...goal,completedAt,completedDate,completedPeriod:d.period,completedMonth:d.month,completedBy:d.activeUser,achievedAmount:d.savings.balance};
       return {...d,savings:{...d.savings,goals:remainingGoals,completedGoals:[achievement,...(d.savings.completedGoals||[])],activeGoalId:nextGoal?.id||null,goal:nextGoal?.amount||0,goalType:nextGoal?.type||"annual",goalMonths:nextGoal?.selectedMonths?.length||nextGoal?.months||12}};
     });
   };
   const removeCompletedGoal = (goal) => setData(d=>({...d,savings:{...d.savings,completedGoals:(d.savings.completedGoals||[]).filter(item=>!(item.id===goal.id&&item.completedAt===goal.completedAt))}}));
-  const removeMovement = (movement) => setData(d => {
-    const balance = movement.type === "entry" ? Math.max(0,d.savings.balance-movement.amount) : d.savings.balance+movement.amount;
-    const contributions = movement.type === "entry" && d.savings.contributions[movement.person] !== undefined ? {...d.savings.contributions,[movement.person]:Math.max(0,d.savings.contributions[movement.person]-movement.amount)} : d.savings.contributions;
-    const users = movement.linkedTransactionId ? Object.fromEntries(Object.entries(d.users).map(([name,account])=>[name,{...account,transactions:account.transactions.filter(t=>t.id!==movement.linkedTransactionId)}])) : d.users;
-    return {...d,savings:{...d.savings,balance,contributions,movements:d.savings.movements.filter(m=>m.id!==movement.id)},users};
-  });
+  const removeMovement = (movement) => setData(d => reverseSavingsMovement(d,movement.id));
   return <>
-    <PageTitle eyebrow="UM SONHO COMPARTILHADO" title="Nosso Cofrinho" subtitle={`Entradas e retiradas de ${data.month.toLowerCase()}, compartilhadas pelo casal.`}>
+    <PageTitle eyebrow="UM SONHO COMPARTILHADO" title="Nosso Cofrinho" subtitle={`Entradas e retiradas de ${periodLabel(data.period).toLowerCase()}, compartilhadas pelo casal.`}>
       <div className="savings-actions"><button className="ghost goal-action" onClick={()=>setModal("savings-goal")}><Target size={17}/> Definir meta</button>{goals.length>0&&<button className="ghost danger-action" onClick={()=>setModal("delete-savings-goal")}><Trash2 size={16}/> Excluir meta</button>}<button className="secondary" onClick={()=>setModal("savings-withdraw")}><ArrowDownLeft size={17}/> Retirar saldo</button><button className="primary" onClick={()=>setModal("saving")}><Plus size={17}/> Guardar dinheiro</button></div>
     </PageTitle>
+    <section className="savings-ledger-summary">
+      <div className="panel collected"><Sparkles/><span>Total arrecadado<small>Todas as contribuições registradas</small></span><b>{money(savingsLedger.collected)}</b></div>
+      <div className="panel available"><PiggyBank/><span>Saldo disponível<small>Valor livre no Cofrinho</small></span><b>{money(savingsLedger.available)}</b></div>
+      <div className="panel withdrawn"><House/><span>Utilizado na Nossa Casa<small>Compras pagas pelo Cofrinho</small></span><b>{money(savingsLedger.homeSpent)}</b></div>
+    </section>
     <section className="savings-overview">
       <div className="savings-chart-card">
-        <div className="chart-copy"><span>PROGRESSO DA META</span><strong>{money(data.savings.balance)}</strong><p>de {money(data.savings.goal)} guardados</p></div>
+        <div className="chart-copy"><span>PROGRESSO DA META ATIVA</span><strong>{money(data.savings.balance)}</strong><p>de {money(goalAmount)} disponíveis para a meta</p></div>
         <div className="goal-bars">
-          <div><span>Meta</span><i><b style={{width:"100%"}}/></i><strong>{money(data.savings.goal)}</strong></div>
+          <div><span>Meta</span><i><b style={{width:"100%"}}/></i><strong>{money(goalAmount)}</strong></div>
           <div><span>Guardado</span><i><b className="saved" style={{width:`${percent}%`}}/></i><strong>{money(data.savings.balance)}</strong></div>
         </div>
         <div className="chart-percent">{percent}%<small>concluído</small></div>
       </div>
-      <div className="month-savings-stats"><div><ArrowUpRight/><span>Entradas em {data.month}<b>{money(monthEntries)}</b></span></div><div><ArrowDownLeft/><span>Saídas em {data.month}<b>{money(monthWithdrawals)}</b></span></div></div>
+      <div className="month-savings-stats"><div><ArrowUpRight/><span>Entradas em {periodLabel(data.period,true)}<b>{money(monthEntries)}</b></span></div><div><ArrowDownLeft/><span>Saídas em {periodLabel(data.period,true)}<b>{money(monthWithdrawals)}</b></span></div></div>
     </section>
     <section className="savings-content-grid">
       <div className="panel goal-settings">
@@ -1037,7 +1118,7 @@ function Savings({ data, setData, setModal }) {
       </div>
       <div className="panel quick-contribution">
         <div className="panel-head"><div><span>CONTRIBUIR</span><h2>Adicionar ao cofrinho</h2></div></div>
-        <form className="saving-form" onSubmit={add}><label>Valor da contribuição<div className="currency-input"><span>R$</span><input required name="amount" type="number" min="0.01" step="0.01" placeholder="0,00"/></div></label><p>Entrada registrada por <b>{data.activeUser}</b> em {data.month}.</p><button className="primary" type="submit">Guardar dinheiro</button></form>
+        <form className="saving-form" onSubmit={add}><label>Valor da contribuição<div className="currency-input"><span>R$</span><input required name="amount" type="number" min="0.01" step="0.01" placeholder="0,00"/></div></label><p>Entrada registrada por <b>{data.activeUser}</b> em {periodLabel(data.period)}.</p><button className="primary" type="submit">Guardar dinheiro</button></form>
       </div>
     </section>
     <section className="panel goal-trophy-history">
@@ -1055,17 +1136,17 @@ function Savings({ data, setData, setModal }) {
         <div className="statement-head-actions">
           <div className="statement-filters">
             <CustomSelect ariaLabel="Tipo de extrato" value={statementMode} onChange={setStatementMode} options={[{value:"total",label:"Extrato total"},{value:"monthly",label:"Extrato mensal"}]}/>
-            {statementMode==="monthly"&&<CustomSelect ariaLabel="Mês do extrato" value={statementMonth} onChange={setStatementMonth} options={months.map(month=>({value:month,label:month}))}/>}
+            {statementMode==="monthly"&&<CustomSelect ariaLabel="Competência do extrato" value={statementMonth} onChange={setStatementMonth} options={statementPeriods.map(period=>({value:period,label:periodLabel(period)}))}/>}
           </div>
           <b className={statementEntries-statementWithdrawals>=0?"positive-value":"negative-value"}>{money(statementEntries-statementWithdrawals)}</b>
         </div>
       </div>
-      {statement.length?<div className="statement-list">{statement.map(m=><div className="statement-row" key={m.id}><div className={`tx-icon ${m.type==="entry"?"income":"expense"}`}>{m.type==="entry"?<ArrowUpRight/>:<ArrowDownLeft/>}</div><span><b>{m.description}</b><small>{m.date} • {m.month} • {m.person}{m.category ? ` • ${m.category}` : ""}</small></span><strong className={m.type==="entry"?"positive-value":"negative-value"}>{m.type==="entry"?"+":"−"} {money(m.amount)}</strong><button className="delete-button" aria-label={`Excluir movimentação ${m.description}`} onClick={()=>removeMovement(m)}><Trash2 size={15}/></button></div>)}</div>:<div className="empty-state compact"><PiggyBank size={25}/><b>Nenhuma movimentação encontrada</b><span>{statementMode==="total"?"As entradas e retiradas do Cofrinho aparecerão aqui.":`Não há movimentações em ${statementMonth}.`}</span></div>}
+      {statement.length?<div className="statement-list">{statement.map(m=><div className="statement-row" key={m.id}><div className={`tx-icon ${m.type==="entry"?"income":"expense"}`}>{m.type==="entry"?<ArrowUpRight/>:<ArrowDownLeft/>}</div><span><b>{m.description}</b><small>{m.date} • {periodLabel(normalizeItemPeriod(m,data.period).period,true)} • {m.person}{m.category ? ` • ${m.category}` : ""}</small></span><strong className={m.type==="entry"?"positive-value":"negative-value"}>{m.type==="entry"?"+":"−"} {money(m.amount)}</strong><button className="delete-button" aria-label={`Excluir movimentação ${m.description}`} onClick={()=>removeMovement(m)}><Trash2 size={15}/></button></div>)}</div>:<div className="empty-state compact"><PiggyBank size={25}/><b>Nenhuma movimentação encontrada</b><span>{statementMode==="total"?"As entradas e retiradas do Cofrinho aparecerão aqui.":`Não há movimentações em ${periodLabel(statementMonth)}.`}</span></div>}
     </section>
   </>;
 }
 
-function Cards({ user, setModal, setData, activeUser, month }) {
+function Cards({ user, setModal, setData, activeUser, month, period }) {
   const removeCard = (cardId) => setData(d=>{
     const account=d.users[activeUser];
     return {...d,users:{...d.users,[activeUser]:{...account,
@@ -1077,7 +1158,7 @@ function Cards({ user, setModal, setData, activeUser, month }) {
   });
   return <>
     <PageTitle eyebrow="MEIOS DE PAGAMENTO" title="Cartões" subtitle="Acompanhe débito, crédito, alimentação e quem utilizou cada cartão."><button className="primary" onClick={()=>setModal("card")}><Plus size={18}/> Adicionar cartão</button></PageTitle>
-    {user.cards.length ? <div className="cards-grid">{user.cards.map(card => {const food=card.cardType==="food"||card.cardType==="benefit",debit=card.cardType==="debit",available=food?(card.balance||0):Math.max((card.limit||0)-(card.spent||0),0),spent=user.transactions.filter(t=>t.cardId===card.id&&t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);return <div className="credit-card-wrap" key={card.id}><button className="card-delete-button" aria-label={`Excluir cartão ${card.name}`} title="Excluir cartão" onClick={()=>removeCard(card.id)}><Trash2 size={16}/></button><div className="credit-card" style={{background:`linear-gradient(135deg, ${card.color}, color-mix(in srgb, ${card.color} 70%, #000))`}}><div><span>{card.name}</span><CreditCard/></div><strong>•••• •••• •••• {card.ending}</strong><small>{food?`Saldo disponível: ${money(available)}`:debit?"Cartão de débito":`Limite disponível: ${money(available)}`}</small></div><div className="card-meta"><span><b>{food?money(card.balance||0):money(spent)}</b> {food?`de saldo em ${month}`:debit?"gastos no débito":`gastos de ${money(card.limit||0)}`}</span>{!debit&&<div><i style={{width:`${food?(card.initialBalance?Math.min((card.balance||0)/card.initialBalance*100,100):0):(card.limit>0?Math.min((card.spent||0)/card.limit*100,100):0)}%`}}/></div>}<div className="card-buttons">{food&&<button onClick={()=>setModal(`card-balance:${card.id}`)}><CircleDollarSign size={16}/> Adicionar saldo</button>}<button onClick={()=>setModal(`card-expense:${card.id}`)}><Plus size={16}/> Movimentar</button><button onClick={()=>setModal(`card-details:${card.id}`)}><Eye size={15}/> Ver detalhes</button></div></div></div>})}</div> : <div className="panel empty-state large"><CreditCard size={30}/><b>Nenhum cartão adicionado</b><span>Adicione seu primeiro cartão para acompanhar suas movimentações.</span><button className="secondary" onClick={()=>setModal("card")}><Plus size={16}/> Adicionar cartão</button></div>}
+    {user.cards.length ? <div className="cards-grid">{user.cards.map(card => {const food=card.cardType==="food"||card.cardType==="benefit",debit=card.cardType==="debit",available=food?(card.balance||0):Math.max((card.limit||0)-(card.spent||0),0),spent=user.transactions.filter(t=>itemMatchesPeriod(t,period,period)&&t.cardId===card.id&&t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);return <div className="credit-card-wrap" key={card.id}><button className="card-delete-button" aria-label={`Excluir cartão ${card.name}`} title="Excluir cartão" onClick={()=>removeCard(card.id)}><Trash2 size={16}/></button><div className="credit-card" style={{background:`linear-gradient(135deg, ${card.color}, color-mix(in srgb, ${card.color} 70%, #000))`}}><div><span>{card.name}</span><CreditCard/></div><strong>•••• •••• •••• {card.ending}</strong><small>{food?`Saldo disponível: ${money(available)}`:debit?"Cartão de débito":`Limite disponível: ${money(available)}`}</small></div><div className="card-meta"><span><b>{food?money(card.balance||0):money(spent)}</b> {food?`de saldo em ${periodLabel(period,true)}`:debit?`gastos em ${periodLabel(period,true)}`:`gastos de ${money(card.limit||0)}`}</span>{!debit&&<div><i style={{width:`${food?(card.initialBalance?Math.min((card.balance||0)/card.initialBalance*100,100):0):(card.limit>0?Math.min((card.spent||0)/card.limit*100,100):0)}%`}}/></div>}<div className="card-buttons">{food&&<button onClick={()=>setModal(`card-balance:${card.id}`)}><CircleDollarSign size={16}/> Adicionar saldo</button>}<button onClick={()=>setModal(`card-expense:${card.id}`)}><Plus size={16}/> Movimentar</button><button onClick={()=>setModal(`card-details:${card.id}`)}><Eye size={15}/> Ver detalhes</button></div></div></div>})}</div> : <div className="panel empty-state large"><CreditCard size={30}/><b>Nenhum cartão adicionado</b><span>Adicione seu primeiro cartão para acompanhar suas movimentações.</span><button className="secondary" onClick={()=>setModal("card")}><Plus size={16}/> Adicionar cartão</button></div>}
   </>;
 }
 const dataName = money;
@@ -1142,7 +1223,11 @@ function Modal({ type, onClose, data, setData, user }) {
   const [alertMessageEdited, setAlertMessageEdited] = useState(false);
   const [cardType, setCardType] = useState("credit");
   const [templateText, setTemplateText] = useState(user.alertTemplate||defaultAlertTemplate);
-  const isForecast = type === "forecast";
+  const isForecastFromQuote=type.startsWith("forecast-from-quote:");
+  const forecastSourceParts=isForecastFromQuote?type.split(":"):[];
+  const forecastSourceQuote=isForecastFromQuote?(data.sharedQuotes||[]).find(quote=>String(quote.id)===forecastSourceParts[1]):null;
+  const forecastSourceItem=isForecastFromQuote?forecastSourceQuote?.items.find(item=>String(item.id)===forecastSourceParts[2]):null;
+  const isForecast = type === "forecast" || isForecastFromQuote;
   const isEditPerson = type.startsWith("edit-person:");
   const editPersonId = isEditPerson ? Number(type.split(":")[1]) : null;
   const personExisting = isEditPerson ? user.people.find(p=>p.id===editPersonId) : null;
@@ -1151,6 +1236,9 @@ function Modal({ type, onClose, data, setData, user }) {
   const isQuote = type === "quote";
   const isHomeGroup = type === "home-group";
   const isWithdrawal = type === "savings-withdraw";
+  const withdrawalHomeOptions=savingsHomeOptions(data);
+  const [withdrawalHomeItemId,setWithdrawalHomeItemId]=useState(String(withdrawalHomeOptions[0]?.itemId||""));
+  const [withdrawalAmount,setWithdrawalAmount]=useState(withdrawalHomeOptions[0]?.suggestedAmount?String(withdrawalHomeOptions[0].suggestedAmount):"");
   const isGoal = type === "savings-goal";
   const isGoalDelete = type === "delete-savings-goal";
   const isCardExpense = type.startsWith("card-expense");
@@ -1186,30 +1274,32 @@ function Modal({ type, onClose, data, setData, user }) {
       const total=+fd.get("planned"), personId=fd.get("person"), person=user.people.find(p=>String(p.id)===personId), cardId=+(fd.get("cardId")||0)||null, card=user.cards.find(c=>c.id===cardId);
       if(!person)return;
       const count=Math.max(2,Math.min(12,+fd.get("forecastInstallments") || 2));
-      const targetMonths=forecastMode==="fixed" ? (selectedMonths.length ? selectedMonths : [data.month]) : forecastMode==="installment" ? Array.from({length:count},(_,i)=>months[(months.indexOf(data.month)+i)%12]) : [data.month];
+      const targetPeriods=forecastMode==="fixed" ? (selectedMonths.length ? selectedMonths : [data.month]).map(month=>periodFrom(data.year,month)) : forecastMode==="installment" ? Array.from({length:count},(_,i)=>addMonths(data.period,i)) : [data.period];
       const seriesId=Date.now(), perMonth=forecastMode==="installment" ? total/count : total;
-      const created=targetMonths.map((month,index)=>({id:seriesId+index,seriesId,type:kind,planned:perMonth,description:fd.get("description"),category:fd.get("category"),personId:person?.id || null,person:person?.name || "",cardId,card:card?.name||"",month,recurrence:forecastMode,installment:forecastMode==="installment"?`${index+1}/${count}`:null,actual:null,transactionId:null}));
-      setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],forecasts:[...created,...(d.users[d.activeUser].forecasts || [])]}}}));
+      const created=targetPeriods.map((period,index)=>{const parts=periodParts(period);return {id:seriesId+index,seriesId,installmentSeriesId:forecastMode==="installment"?seriesId:null,type:kind,planned:perMonth,seriesTotal:forecastMode==="installment"?total:null,description:fd.get("description"),category:fd.get("category"),personId:person?.id || null,person:person?.name || "",cardId,card:card?.name||"",period,year:parts.year,month:parts.month,recurrence:forecastMode,installment:forecastMode==="installment"?`${index+1}/${count}`:null,installmentIndex:forecastMode==="installment"?index+1:null,installmentCount:forecastMode==="installment"?count:null,actual:null,transactionId:null,source:isForecastFromQuote?"Cotação":"Planejamento",quoteId:forecastSourceQuote?.id||null,quoteItemId:forecastSourceItem?.id||null,homeGroupId:forecastSourceQuote?.homeGroupId||null,homeItemId:forecastSourceQuote?.homeItemId||null};});
+      setData(d=>({...d,
+        sharedQuotes:isForecastFromQuote?(d.sharedQuotes||[]).map(quote=>quote.id===forecastSourceQuote?.id?{...quote,items:quote.items.map(item=>item.id===forecastSourceItem?.id?{...item,forecastId:seriesId,forecastOwner:d.activeUser}:item)}:quote):d.sharedQuotes,
+        users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],forecasts:[...created,...(d.users[d.activeUser].forecasts || [])]}}
+      }));
     }
     else if(isQuote){const id=Date.now(),items=fd.get("items").split("\n").map(x=>x.trim()).filter(Boolean).map((name,index)=>({id:id+index+1,name,link:"",value:0,status:"Analisando",checked:false})),quote={id,subject:fd.get("subject").trim(),status:"Em andamento",items};setData(d=>({...d,sharedQuotes:[quote,...(d.sharedQuotes||[])]}));}
     else if(isHomeGroup){const group={id:Date.now(),name:fd.get("groupName").trim(),items:[]};setData(d=>({...d,homeGroups:[...(d.homeGroups||[]),group]}));}
     else if(isPerson){ const person={id:personExisting?.id||Date.now(),name:fd.get("name").trim(),whatsapp:fd.get("whatsapp").trim()}; setData(d=>{const account=d.users[d.activeUser];if(!isEditPerson)return {...d,users:{...d.users,[d.activeUser]:{...account,people:[person,...(account.people||[])]}}};return {...d,users:{...d.users,[d.activeUser]:{...account,people:account.people.map(p=>p.id===editPersonId?person:p),forecasts:account.forecasts.map(f=>f.personId===editPersonId?{...f,person:person.name}:f),transactions:account.transactions.map(t=>t.personId===editPersonId?{...t,person:person.name,usedBy:t.usedBy?person.name:t.usedBy}:t),alerts:account.alerts.map(a=>a.personId===editPersonId?{...a,personName:person.name,whatsapp:person.whatsapp}:a)}}}}); }
-    else if(type==="saving"){ const amount=+fd.get("amount"); const movement={id:Date.now(),type:"entry",amount,description:`Contribuição de ${data.activeUser}`,person:data.activeUser,owner:data.activeUser,month:data.month,date:"Hoje"}; setData(d=>({...d,savings:{...d.savings,balance:d.savings.balance+amount,movements:[movement,...d.savings.movements],contributions:{...d.savings.contributions,[d.activeUser]:d.savings.contributions[d.activeUser]+amount}}})); }
+    else if(type==="saving"){ const amount=+fd.get("amount"); const movement={id:Date.now(),type:"entry",amount,description:`Contribuição de ${data.activeUser}`,person:data.activeUser,owner:data.activeUser,period:data.period,year:data.year,month:data.month,date:"Hoje"}; setData(d=>({...d,savings:{...d.savings,balance:d.savings.balance+amount,movements:[movement,...d.savings.movements],contributions:{...d.savings.contributions,[d.activeUser]:d.savings.contributions[d.activeUser]+amount}}})); }
     else if(isWithdrawal){
-      const amount=+fd.get("amount"), reason=fd.get("reason").trim(), category=fd.get("category"), personId=fd.get("person") || "", linkedPerson=user.people.find(p=>String(p.id)===personId), person=linkedPerson?.name || data.activeUser, createExpense=fd.get("createExpense")==="on", id=Date.now();
-      if(amount<=0 || amount>data.savings.balance) return;
-      const movement={id,type:"withdrawal",amount,description:reason,category,personId:linkedPerson?.id || null,person,owner:data.activeUser,month:data.month,date:"Hoje",linkedTransactionId:createExpense?id+1:null};
-      setData(d=>{const account=d.users[d.activeUser];const transaction=createExpense?{id:id+1,type:"expense",title:reason,category,person,amount,date:"Hoje",month:d.month,status:"Realizado",unplanned:true,reason,source:"Cofrinho",savingsMovementId:id}:null;return {...d,savings:{...d.savings,balance:d.savings.balance-amount,movements:[movement,...d.savings.movements]},users:createExpense?{...d.users,[d.activeUser]:{...account,transactions:[transaction,...account.transactions]}}:d.users};});
+      const amount=+fd.get("amount"), reason=fd.get("reason").trim(), category=fd.get("category"), personId=fd.get("person") || "", linkedPerson=user.people.find(p=>String(p.id)===personId), person=linkedPerson?.name || data.activeUser, selectedHomeItem=withdrawalHomeOptions.find(item=>String(item.itemId)===String(fd.get("homeItemId"))), id=Date.now();
+      if(!selectedHomeItem||amount<=0 || amount>data.savings.balance) return;
+      setData(d=>applySavingsHomePurchase(d,{id,groupId:selectedHomeItem.groupId,itemId:selectedHomeItem.itemId,amount,reason,category,personId:linkedPerson?.id||null,person}));
     }
-    else if(type==="card"){ const initial=cardType==="food"?(+fd.get("initialBalance")||0):0;const card={id:Date.now(),name:fd.get("name"),ending:fd.get("ending"),cardType,limit:cardType==="credit"?(+fd.get("limit")||0):0,spent:0,balance:initial,initialBalance:initial,monthlyBalances:cardType==="food"?{[data.month]:initial}:{},balanceHistory:initial>0?[{id:Date.now()+1,month:data.month,amount:initial,date:dateLabel()}]:[],closingDay:cardType==="credit"?(+fd.get("closingDay")||1):null,color:fd.get("color")||"#173f35"}; setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],cards:[...d.users[d.activeUser].cards,card]}}})); }
+    else if(type==="card"){ const initial=cardType==="food"?(+fd.get("initialBalance")||0):0;const card={id:Date.now(),name:fd.get("name"),ending:fd.get("ending"),cardType,limit:cardType==="credit"?(+fd.get("limit")||0):0,spent:0,balance:initial,initialBalance:initial,monthlyBalances:cardType==="food"?{[data.period]:initial}:{},balanceHistory:initial>0?[{id:Date.now()+1,period:data.period,year:data.year,month:data.month,amount:initial,date:dateLabel()}]:[],closingDay:cardType==="credit"?(+fd.get("closingDay")||1):null,color:fd.get("color")||"#173f35"}; setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],cards:[...d.users[d.activeUser].cards,card]}}})); }
     else if(isCardBalance){
       const amount=Math.max(+fd.get("balanceAmount")||0,0), id=Date.now();
       if(amount<=0)return;
-      setData(d=>{const account=d.users[d.activeUser];return {...d,users:{...d.users,[d.activeUser]:{...account,cards:account.cards.map(card=>card.id===balanceCardId?{...card,balance:(card.balance||0)+amount,initialBalance:(card.initialBalance||0)+amount,monthlyBalances:{...(card.monthlyBalances||{}),[d.month]:((card.monthlyBalances||{})[d.month]||0)+amount},balanceHistory:[{id,month:d.month,amount,date:dateLabel()},...(card.balanceHistory||[])]}:card)}}}});
+      setData(d=>{const account=d.users[d.activeUser];return {...d,users:{...d.users,[d.activeUser]:{...account,cards:account.cards.map(card=>card.id===balanceCardId?{...card,balance:(card.balance||0)+amount,initialBalance:(card.initialBalance||0)+amount,monthlyBalances:{...(card.monthlyBalances||{}),[d.period]:((card.monthlyBalances||{})[d.period]||0)+amount},balanceHistory:[{id,period:d.period,year:d.year,month:d.month,amount,date:dateLabel()},...(card.balanceHistory||[])]}:card)}}}});
     }
     else if(isCardDetails&&!isCardView){ const color=fd.get("color");setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],cards:d.users[d.activeUser].cards.map(c=>c.id===detailCardId?{...c,color}:c)}}})); }
-    else if(isCardExpense){ const amount=+fd.get("amount"),id=Date.now(),card=user.cards.find(c=>c.id===selectedCardId),person=user.people.find(p=>String(p.id)===fd.get("personId")); const tx={id,createdAt:id,type:kind,title:fd.get("title"),category:fd.get("category"),amount,date:dateLabel(),month:data.month,status:"Realizado",unplanned:true,source:"Cartões",personId:person?.id||null,person:person?.name||data.activeUser,usedBy:person?.name||data.activeUser,cardId:card?.id,card:card?.name,cardPaymentStatus:card?.cardType==="credit"&&kind==="expense"?"Pendente":"Pago"}; setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],transactions:[tx,...d.users[d.activeUser].transactions],cards:d.users[d.activeUser].cards.map(c=>c.id===selectedCardId?adjustCard(c,kind,amount,1):c)}}})); }
-    else { const amount=+fd.get("amount"), count=+(fd.get("count")||1),cardId=+(fd.get("cardId")||0)||null,card=user.cards.find(c=>c.id===cardId),person=user.people.find(p=>String(p.id)===fd.get("personId")),createdAt=Date.now(); const base={id:createdAt,createdAt,type:kind,title:fd.get("title"),category:fd.get("category"),personId:person?.id||null,person:person?.name||"",amount:installments?amount/count:amount,date:dateLabel(),month:data.month,status:fd.get("status"),fixed:fd.get("fixed")==="on",unplanned:true,source:"Lançamentos",cardId,card:card?.name||"",cardPaymentStatus:card?.cardType==="credit"&&kind==="expense"?"Pendente":"Pago"}; const created=Array.from({length:count},(_,i)=>({...base,id:base.id+i,createdAt:base.createdAt+i,month:months[(months.indexOf(data.month)+i)%12],status:i===0?base.status:"Pendente",installment:installments?`${i+1}/${count}`:undefined,date:i===0?dateLabel():`${months[(months.indexOf(data.month)+i)%12].slice(0,3).toLowerCase()} (previsto)`})); const realizedAmount=created.filter(t=>t.status==="Realizado").reduce((s,t)=>s+t.amount,0); setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],transactions:[...created,...d.users[d.activeUser].transactions],cards:d.users[d.activeUser].cards.map(c=>c.id===cardId&&realizedAmount>0?adjustCard(c,kind,realizedAmount,1):c)}}})); }
+    else if(isCardExpense){ const amount=+fd.get("amount"),id=Date.now(),card=user.cards.find(c=>c.id===selectedCardId),person=user.people.find(p=>String(p.id)===fd.get("personId")); const tx={id,createdAt:id,type:kind,title:fd.get("title"),category:fd.get("category"),amount,date:dateLabel(),period:data.period,year:data.year,month:data.month,status:"Realizado",unplanned:true,source:"Cartões",personId:person?.id||null,person:person?.name||data.activeUser,usedBy:person?.name||data.activeUser,cardId:card?.id,card:card?.name,cardPaymentStatus:card?.cardType==="credit"&&kind==="expense"?"Pendente":"Pago"}; setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],transactions:[tx,...d.users[d.activeUser].transactions],cards:d.users[d.activeUser].cards.map(c=>c.id===selectedCardId?adjustCard(c,kind,amount,1):c)}}})); }
+    else { const amount=+fd.get("amount"), count=+(fd.get("count")||1),cardId=+(fd.get("cardId")||0)||null,card=user.cards.find(c=>c.id===cardId),person=user.people.find(p=>String(p.id)===fd.get("personId")),createdAt=Date.now(); const base={id:createdAt,createdAt,type:kind,title:fd.get("title"),category:fd.get("category"),personId:person?.id||null,person:person?.name||"",amount:installments?amount/count:amount,date:dateLabel(),period:data.period,year:data.year,month:data.month,status:fd.get("status"),fixed:fd.get("fixed")==="on",unplanned:true,source:"Lançamentos",cardId,card:card?.name||"",cardPaymentStatus:card?.cardType==="credit"&&kind==="expense"?"Pendente":"Pago",installmentSeriesId:installments?createdAt:null,seriesTotal:installments?amount:null,installmentCount:installments?count:null}; const created=Array.from({length:count},(_,i)=>{const period=addMonths(data.period,i),parts=periodParts(period);return {...base,id:base.id+i,createdAt:base.createdAt+i,period,year:parts.year,month:parts.month,status:i===0?base.status:"Pendente",installment:installments?`${i+1}/${count}`:undefined,installmentIndex:installments?i+1:null,date:i===0?dateLabel():`${periodLabel(period,true).toLowerCase()} (previsto)`};}); const realizedAmount=created.filter(t=>t.status==="Realizado").reduce((s,t)=>s+t.amount,0); setData(d=>({...d,users:{...d.users,[d.activeUser]:{...d.users[d.activeUser],transactions:[...created,...d.users[d.activeUser].transactions],cards:d.users[d.activeUser].cards.map(c=>c.id===cardId&&realizedAmount>0?adjustCard(c,kind,realizedAmount,1):c)}}})); }
     onClose();
   };
   const detailCard = isCardDetails ? user.cards.find(c=>c.id===detailCardId) : null;
@@ -1221,18 +1311,18 @@ function Modal({ type, onClose, data, setData, user }) {
       {isAlert&&<><label>Título do alerta<input required name="title" value={alertTitle} onChange={e=>{const title=e.target.value;setAlertTitle(title);if(!alertMessageEdited)setAlertMessage(buildAlertMessage(title,alertAmount));}} placeholder="Ex.: Cobrar valor do cartão"/></label><div className="form-row"><label>Ativar alerta em<input required name="activationDate" type="date" defaultValue={alertExisting?.activationDate||localDateKey()}/></label><label>Valor da cobrança<input required name="alertAmount" type="number" min="0" step="0.01" value={alertAmount} onChange={e=>{const amount=e.target.value;setAlertAmount(amount);if(!alertMessageEdited)setAlertMessage(buildAlertMessage(alertTitle,amount));}} placeholder="0,00"/></label></div><div className="form-row"><label>Cartão <small>(opcional)</small><FormSelect name="cardId" ariaLabel="Cartão do alerta" defaultValue={alertExisting?.cardId||alertTransaction?.cardId||""} options={[{value:"",label:"Sem cartão"},...user.cards.map(c=>({value:String(c.id),label:`${c.name} • fecha dia ${c.closingDay||1}`}))]}/></label><label>Pessoa<FormSelect name="personId" ariaLabel="Pessoa do alerta" defaultValue={alertExisting?.personId||alertTransaction?.personId||""} options={[{value:"",label:"Selecione uma pessoa"},...user.people.map(p=>({value:String(p.id),label:p.name}))]}/></label></div><label>Texto da mensagem<textarea required name="message" value={alertMessage} onChange={e=>{setAlertMessage(e.target.value);setAlertMessageEdited(true);}}/></label>{alertTransaction&&<p className="form-hint"><ReceiptText size={14}/> Alerta conectado ao lançamento “{alertTransaction.title}”.</p>}{!user.people.length&&<p className="form-hint"><AlertTriangle size={14}/> Cadastre uma pessoa antes de criar o alerta.</p>}</>}
       {isQuote&&<><label>Assunto da cotação<input required name="subject" placeholder="Ex.: Móveis da casa"/></label><label>Itens iniciais da checklist <small>(um por linha)</small><textarea name="items" placeholder={"Sofá para a sala\nMesa de jantar\nRack para televisão"}/></label><p className="form-hint"><Link2 size={14}/> Depois de criar, você poderá anexar um link diferente a cada item.</p></>}
       {isHomeGroup&&<><label>Nome do grupo<input required name="groupName" placeholder="Ex.: Cozinha, Sala ou Quarto"/></label><p className="form-hint"><House size={14}/> Depois de criar o grupo, adicione os itens e acompanhe o status de cada compra.</p></>}
-      {isCardDetails&&(()=>{const card=user.cards.find(c=>c.id===detailCardId),items=user.transactions.filter(t=>t.cardId===detailCardId),food=card?.cardType==="food"||card?.cardType==="benefit",debit=card?.cardType==="debit",spent=items.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0),monthLoaded=(card?.monthlyBalances||{})[data.month]||0;return <>{!debit&&<div className="detail-balance"><span>{food?"Saldo atual":"Limite disponível"}</span><b>{money(food?(card?.balance||0):Math.max((card?.limit||0)-(card?.spent||0),0))}</b><small>{food?`${money(monthLoaded)} adicionados em ${data.month}`:`Fechamento dia ${card?.closingDay||1}`}</small></div>}{debit&&<div className="detail-balance"><span>TOTAL MOVIMENTADO NO DÉBITO</span><b>{money(spent)}</b><small>Sem controle de saldo ou limite</small></div>}{!isCardView&&<label>Cor de identificação<input name="color" type="color" defaultValue={card?.color||"#173f35"}/></label>}<div className="card-statement"><span>ÚLTIMAS MOVIMENTAÇÕES</span>{items.length?items.slice(0,5).map(t=><div key={t.id}><b>{t.title}</b><small>{t.date} • {t.category}{t.person?` • ${t.person}`:""}</small><strong className={t.type==="income"?"positive-value":"negative-value"}>{t.type==="income"?"+":"−"} {money(t.amount)}</strong></div>):<p>Nenhuma movimentação neste cartão.</p>}</div></>})()}
+      {isCardDetails&&(()=>{const card=user.cards.find(c=>c.id===detailCardId),items=user.transactions.filter(t=>t.cardId===detailCardId),food=card?.cardType==="food"||card?.cardType==="benefit",debit=card?.cardType==="debit",spent=items.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0),monthLoaded=(card?.monthlyBalances||{})[data.period]||0;return <>{!debit&&<div className="detail-balance"><span>{food?"Saldo atual":"Limite disponível"}</span><b>{money(food?(card?.balance||0):Math.max((card?.limit||0)-(card?.spent||0),0))}</b><small>{food?`${money(monthLoaded)} adicionados em ${periodLabel(data.period)}`:`Fechamento dia ${card?.closingDay||1}`}</small></div>}{debit&&<div className="detail-balance"><span>TOTAL MOVIMENTADO NO DÉBITO</span><b>{money(spent)}</b><small>Sem controle de saldo ou limite</small></div>}{!isCardView&&<label>Cor de identificação<input name="color" type="color" defaultValue={card?.color||"#173f35"}/></label>}<div className="card-statement"><span>ÚLTIMAS MOVIMENTAÇÕES</span>{items.length?items.slice(0,5).map(t=><div key={t.id}><b>{t.title}</b><small>{t.date} • {t.category}{t.person?` • ${t.person}`:""}</small><strong className={t.type==="income"?"positive-value":"negative-value"}>{t.type==="income"?"+":"−"} {money(t.amount)}</strong></div>):<p>Nenhuma movimentação neste cartão.</p>}</div></>})()}
       {isCardBalance&&(()=>{const card=user.cards.find(c=>c.id===balanceCardId);return <><div className="withdraw-balance"><span>Saldo atual</span><b>{money(card?.balance||0)}</b></div><label>Saldo recebido em {data.month}<input required name="balanceAmount" type="number" min="0.01" step="0.01" placeholder="0,00"/></label><p className="form-hint"><CircleDollarSign size={14}/> O valor será somado ao saldo atual e os gastos continuarão sendo debitados automaticamente.</p></>})()}
       {isGoal&&<><label>Nome da meta<input required name="goalName" placeholder="Ex.: Reserva de emergência"/></label><fieldset className="goal-modal-options"><legend>Como será esta meta?</legend><div><button type="button" className={goalType==="annual"?"active":""} onClick={()=>setGoalType("annual")}><Target/><span><b>Meta anual</b><small>Distribuída em 12 meses</small></span></button><button type="button" className={goalType==="monthly"?"active":""} onClick={()=>setGoalType("monthly")}><CalendarDays/><span><b>Meta por período</b><small>Escolha os meses da meta</small></span></button></div></fieldset><label>Valor total da meta<div className="modal-money-input"><span>R$</span><input required name="goalAmount" type="number" min="0.01" step="0.01" placeholder="0,00"/></div></label>{goalType==="monthly"&&<div className="month-grid goal-month-grid"><span>Em quais meses esta meta será válida?</span><div>{months.map(m=><label className={goalMonths.includes(m)?"selected":""} key={m}><input type="checkbox" checked={goalMonths.includes(m)} onChange={()=>setGoalMonths(current=>current.includes(m)?current.filter(x=>x!==m):[...current,m])}/>{m.slice(0,3)}</label>)}</div><small>{goalMonths.length} {goalMonths.length===1?"mês selecionado":"meses selecionados"}</small></div>}<p className="form-hint"><Sparkles size={14}/> Após salvar, esta meta ficará bloqueada para edição.</p></>}
       {isGoalDelete&&<><label>Meta a excluir<select required name="goalId">{(data.savings.goals||[]).map(g=><option value={g.id} key={g.id}>{g.name} — {money(g.amount)}</option>)}</select></label><p className="delete-goal-warning"><Trash2 size={16}/> A meta será removida, mas o saldo e o extrato do Cofrinho serão preservados.</p></>}
-      {isForecast&&<><div className="segmented"><button type="button" className={kind==="expense"?"active":""} onClick={()=>setKind("expense")}><ArrowDownLeft/> Despesa</button><button type="button" className={kind==="income"?"active":""} onClick={()=>setKind("income")}><ArrowUpRight/> Receita</button></div><label>Previsão do valor<input required name="planned" type="number" min="0" step="0.01" placeholder="0,00"/></label><label>Descrição<input required name="description" placeholder="Ex.: Supermercado do mês"/></label><div className="form-row"><label>Categoria<select name="category"><option>Alimentação</option><option>Moradia</option><option>Transporte</option><option>Saúde</option><option>Educação</option><option>Lazer</option><option>Trabalho</option><option>Outros</option></select></label><label>Pessoa vinculada<select required name="person" defaultValue=""><option value="" disabled>Selecione uma pessoa</option>{user.people.map(p=><option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>Cartão vinculado <small>(opcional)</small><select name="cardId"><option value="">Sem cartão</option>{user.cards.map(c=><option value={c.id} key={c.id}>{c.name} • {c.cardType==="food"?"Alimentação":c.cardType==="debit"?"Débito":"Crédito"}</option>)}</select></label><fieldset className="forecast-mode"><legend>Como este valor será lançado?</legend><div>{[["single","Único","Somente em "+data.month],["fixed","Fixo","Repete nos meses escolhidos"],["installment","Parcelado","Divide o total em parcelas"]].map(([value,label,note])=><button type="button" className={forecastMode===value?"active":""} onClick={()=>setForecastMode(value)} key={value}><b>{label}</b><span>{note}</span></button>)}</div></fieldset>{forecastMode==="fixed"&&<div className="month-grid"><span>Selecione os meses</span><div>{months.map(m=><label className={selectedMonths.includes(m)?"selected":""} key={m}><input type="checkbox" checked={selectedMonths.includes(m)} onChange={()=>setSelectedMonths(current=>current.includes(m)?current.filter(x=>x!==m):[...current,m])}/>{m.slice(0,3)}</label>)}</div></div>}{forecastMode==="installment"&&<label>Quantidade de parcelas<input name="forecastInstallments" type="number" min="2" max="48" defaultValue="2"/></label>}{!user.people.length&&<p className="form-hint"><AlertTriangle size={14}/> Cadastre uma pessoa no menu Pessoas antes de adicionar uma previsão.</p>}</>}
+      {isForecast&&<>{isForecastFromQuote&&<p className="form-hint linked-source-hint"><ClipboardList size={14}/> Opção escolhida em “{forecastSourceQuote?.subject}”. O vínculo será mantido até o lançamento.</p>}<div className="segmented"><button type="button" className={kind==="expense"?"active":""} onClick={()=>setKind("expense")}><ArrowDownLeft/> Despesa</button><button type="button" className={kind==="income"?"active":""} onClick={()=>setKind("income")}><ArrowUpRight/> Receita</button></div><label>Previsão do valor<input required name="planned" type="number" min="0" step="0.01" defaultValue={forecastSourceItem?.value||""} placeholder="0,00"/></label><label>Descrição<input required name="description" defaultValue={forecastSourceItem?.name||""} placeholder="Ex.: Supermercado do mês"/></label><div className="form-row"><label>Categoria<select name="category"><option>Alimentação</option><option>Moradia</option><option>Transporte</option><option>Saúde</option><option>Educação</option><option>Lazer</option><option>Trabalho</option><option>Outros</option></select></label><label>Pessoa vinculada<select required name="person" defaultValue=""><option value="" disabled>Selecione uma pessoa</option>{user.people.map(p=><option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>Cartão vinculado <small>(opcional)</small><select name="cardId"><option value="">Sem cartão</option>{user.cards.map(c=><option value={c.id} key={c.id}>{c.name} • {c.cardType==="food"?"Alimentação":c.cardType==="debit"?"Débito":"Crédito"}</option>)}</select></label><fieldset className="forecast-mode"><legend>Como este valor será lançado?</legend><div>{[["single","Único","Somente em "+periodLabel(data.period,true)],["fixed","Fixo","Repete nos meses escolhidos"],["installment","Parcelado","Divide o total em parcelas"]].map(([value,label,note])=><button type="button" className={forecastMode===value?"active":""} onClick={()=>setForecastMode(value)} key={value}><b>{label}</b><span>{note}</span></button>)}</div></fieldset>{forecastMode==="fixed"&&<div className="month-grid"><span>Selecione os meses de {data.year}</span><div>{months.map(m=><label className={selectedMonths.includes(m)?"selected":""} key={m}><input type="checkbox" checked={selectedMonths.includes(m)} onChange={()=>setSelectedMonths(current=>current.includes(m)?current.filter(x=>x!==m):[...current,m])}/>{m.slice(0,3)}</label>)}</div></div>}{forecastMode==="installment"&&<label>Quantidade de parcelas<input name="forecastInstallments" type="number" min="2" max="48" defaultValue="2"/></label>}{!user.people.length&&<p className="form-hint"><AlertTriangle size={14}/> Cadastre uma pessoa no menu Pessoas antes de adicionar uma previsão.</p>}</>}
       {isPerson&&<><label>Nome<input required name="name" defaultValue={personExisting?.name||""} placeholder="Nome da pessoa"/></label><label>Número de WhatsApp<input required name="whatsapp" type="tel" inputMode="numeric" value={phone} onChange={e=>setPhone(formatPhone(e.target.value))} pattern="\(\d{2}\) \d{4}-\d{4}" placeholder="(00) XXXX-XXXX"/></label></>}
-      {isWithdrawal&&<><div className="withdraw-balance"><span>Saldo disponível</span><b>{money(data.savings.balance)}</b></div><label>Valor da retirada<input required name="amount" type="number" min="0.01" max={data.savings.balance} step="0.01" placeholder="0,00"/></label><label>Motivo da retirada<input required name="reason" placeholder="Ex.: Conserto emergencial"/></label><div className="form-row"><label>Categoria<select name="category"><option>Alimentação</option><option>Moradia</option><option>Transporte</option><option>Saúde</option><option>Educação</option><option>Lazer</option><option>Compras</option><option>Emergência</option><option>Outros</option></select></label><label>Pessoa vinculada <small>(opcional)</small><select name="person"><option value="">Titular da conta</option>{user.people.map(p=><option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label className="check withdrawal-check"><input type="checkbox" name="createExpense"/> Deseja fazer o lançamento dessa retirada?</label><p className="form-hint"><ReceiptText size={14}/> Ao marcar, será criada uma despesa em “Fora do planejado”.</p></>}
+      {isWithdrawal&&<><div className="withdraw-balance"><span>Saldo disponível</span><b>{money(data.savings.balance)}</b></div>{withdrawalHomeOptions.length?<><label>Item da Nossa Casa<FormSelect name="homeItemId" ariaLabel="Item da Nossa Casa pago pelo Cofrinho" value={withdrawalHomeItemId} onChange={value=>{setWithdrawalHomeItemId(String(value));const selected=withdrawalHomeOptions.find(item=>String(item.itemId)===String(value));if(selected?.suggestedAmount)setWithdrawalAmount(String(selected.suggestedAmount));}} options={withdrawalHomeOptions.map(item=>({value:String(item.itemId),label:`${item.groupName} • ${item.itemName}`}))}/></label><label>Valor utilizado<input required name="amount" type="number" min="0.01" max={data.savings.balance} step="0.01" value={withdrawalAmount} onChange={event=>setWithdrawalAmount(event.target.value)} placeholder="0,00"/></label><label>Motivo ou observação<input required name="reason" placeholder="Ex.: Compra do item escolhido"/></label><div className="form-row"><label>Categoria<FormSelect name="category" ariaLabel="Categoria da compra da casa" defaultValue="Moradia" options={["Moradia","Móveis","Eletrodomésticos","Decoração","Manutenção","Outros"].map(label=>({value:label,label}))}/></label><label>Pessoa vinculada <small>(opcional)</small><FormSelect name="person" ariaLabel="Pessoa vinculada à compra" defaultValue="" options={[{value:"",label:"Titular da conta"},...user.people.map(p=>({value:String(p.id),label:p.name}))]}/></label></div><p className="form-hint"><ReceiptText size={14}/> O item será marcado como comprado e aparecerá em Lançamentos sem alterar receitas, despesas ou saldo mensal.</p></>:<div className="empty-state compact withdrawal-home-empty"><House size={24}/><b>Nenhum item disponível na Nossa Casa</b><span>Adicione um item pendente ou em cotação antes de retirar dinheiro do Cofrinho.</span></div>}</>}
       {type==="transaction"&&<><div className="segmented"><button type="button" className={kind==="expense"?"active":""} onClick={()=>setKind("expense")}><ArrowDownLeft/> Despesa</button><button type="button" className={kind==="income"?"active":""} onClick={()=>setKind("income")}><ArrowUpRight/> Receita</button></div><label>Descrição<input required name="title" placeholder="Ex.: Supermercado"/></label><div className="form-row"><label>Valor total<input required name="amount" type="number" step="0.01" placeholder="0,00"/></label><label>Categoria<select name="category"><option>Alimentação</option><option>Moradia</option><option>Transporte</option><option>Saúde</option><option>Educação</option><option>Lazer</option><option>Trabalho</option><option>Outros</option></select></label></div><div className="form-row"><label>Cartão <small>(opcional)</small><select name="cardId"><option value="">Sem cartão</option>{user.cards.map(c=><option value={c.id} key={c.id}>{c.name}</option>)}</select></label><label>Pessoa<select name="personId"><option value="">Nenhuma</option>{user.people.map(p=><option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><div className="form-row"><label>Status<select name="status"><option>Realizado</option><option>Pendente</option></select></label><label className="check"><input type="checkbox" name="fixed"/><span>É uma conta fixa</span></label></div>{kind==="expense"&&<label className={`check parcel inline-installment ${installments?"checked":""}`}><span className="check-copy"><input type="checkbox" checked={installments} onChange={e=>setInstallments(e.target.checked)}/><span>Esta compra foi parcelada</span></span>{installments&&<span className="installment-count"><small>Parcelas</small><input aria-label="Quantidade de parcelas" name="count" type="number" min="2" max="48" defaultValue="2"/></span>}</label>}</>}
       {type==="saving"&&<label>Valor da contribuição<input required name="amount" type="number" step="0.01" placeholder="0,00"/></label>}
       {type==="card"&&<><label>Nome do cartão<input required name="name" placeholder="Ex.: Alimentação"/></label><div className="form-row"><label>Tipo<FormSelect name="cardType" ariaLabel="Tipo do cartão" value={cardType} onChange={setCardType} options={[{value:"debit",label:"Débito"},{value:"credit",label:"Crédito"},{value:"food",label:"Alimentação"}]}/></label><label>Cor<input name="color" type="color" defaultValue="#173f35"/></label></div><label>Últimos 4 dígitos<input required name="ending" maxLength="4" inputMode="numeric" placeholder="0000"/></label>{cardType==="credit"&&<div className="form-row"><label>Dia de fechamento<input required name="closingDay" type="number" min="1" max="31" defaultValue="20"/></label><label>Limite de crédito<input required name="limit" type="number" min="0" step="0.01" placeholder="0,00"/></label></div>}{cardType==="food"&&<label>Saldo<input required name="initialBalance" type="number" min="0" step="0.01" placeholder="0,00"/></label>}{cardType==="debit"&&<p className="form-hint"><CreditCard size={14}/> Cartões de débito registram movimentações, sem controle de saldo ou limite.</p>}</>}
       {isCardExpense&&<><div className="segmented"><button type="button" className={kind==="expense"?"active":""} onClick={()=>setKind("expense")}><ArrowDownLeft/> Débito</button><button type="button" className={kind==="income"?"active":""} onClick={()=>setKind("income")}><ArrowUpRight/> Crédito</button></div><label>Descrição<input required name="title" placeholder="Ex.: Jantar"/></label><div className="form-row"><label>Valor<input required name="amount" type="number" step="0.01"/></label><label>Categoria<FormSelect name="category" ariaLabel="Categoria da movimentação" defaultValue="Alimentação" options={["Alimentação","Compras","Transporte","Lazer","Outros"].map(label=>({value:label,label}))}/></label></div><label>Pessoa vinculada<FormSelect name="personId" ariaLabel="Pessoa vinculada à movimentação" defaultValue="" options={[{value:"",label:"Titular da conta"},...user.people.map(p=>({value:String(p.id),label:p.name}))]}/></label></>}
-      <div className="modal-actions">{isCardView?<button type="button" className="primary" onClick={onClose}>Fechar</button>:<><button type="button" className="ghost" onClick={onClose}>Cancelar</button><button className={isGoalDelete?"danger-button":"primary"} type="submit">{isAlertTemplate?"Salvar mensagem":isEditAlert?"Salvar alterações":isAlert?"Criar alerta":isQuote?"Criar cotação":isHomeGroup?"Criar grupo":isCardDetails?"Salvar cor":isCardBalance?"Adicionar saldo":isGoal?"Salvar meta":isGoalDelete?"Excluir meta":isForecast ? "Adicionar previsão" : isEditPerson?"Salvar alterações":isPerson ? "Salvar pessoa" : isWithdrawal ? "Confirmar retirada" : "Salvar lançamento"}</button></>}</div>
+      <div className="modal-actions">{isCardView?<button type="button" className="primary" onClick={onClose}>Fechar</button>:<><button type="button" className="ghost" onClick={onClose}>Cancelar</button><button disabled={isWithdrawal&&!withdrawalHomeOptions.length} className={isGoalDelete?"danger-button":"primary"} type="submit">{isAlertTemplate?"Salvar mensagem":isEditAlert?"Salvar alterações":isAlert?"Criar alerta":isQuote?"Criar cotação":isHomeGroup?"Criar grupo":isCardDetails?"Salvar cor":isCardBalance?"Adicionar saldo":isGoal?"Salvar meta":isGoalDelete?"Excluir meta":isForecast ? "Adicionar previsão" : isEditPerson?"Salvar alterações":isPerson ? "Salvar pessoa" : isWithdrawal ? "Confirmar compra" : "Salvar lançamento"}</button></>}</div>
     </form>
   </div></div>;
 }
