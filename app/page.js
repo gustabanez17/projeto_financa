@@ -388,16 +388,14 @@ export default function Home() {
     return Boolean(forecast && forecastIsConfirmed(forecast) && forecast.transactionId===transaction.id);
   });
   const automaticFixedIncome = financialMonthForecasts.filter(forecast=>forecast.type==="income"&&forecastIsAutomaticFixed(forecast)).reduce((sum,forecast)=>sum+forecast.planned,0);
-  const automaticFixedExpenses = financialMonthForecasts.filter(forecast=>forecast.type==="expense"&&forecastIsAutomaticFixed(forecast)).reduce((sum,forecast)=>sum+forecast.planned,0);
   const paidFixedExpenses = financialMonthForecasts.filter(forecast=>forecast.type==="expense"&&forecastIsAutomaticFixed(forecast)&&fixedExpensePaymentStatus(forecast)==="Pago").reduce((sum,forecast)=>sum+forecast.planned,0);
   const realizedIncome = financialMonthTransactions.filter(t => t.type === "income" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + automaticFixedIncome;
   const realizedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && t.status === "Realizado").reduce((s, t) => s + t.amount, 0) + paidFixedExpenses;
-  const committedExpenses = financialMonthTransactions.filter(t => t.type === "expense" && ["Realizado","Pendente"].includes(t.status)).reduce((s, t) => s + t.amount, 0) + automaticFixedExpenses;
   const plannedIncome = financialMonthForecasts.filter(f => f.type === "income").reduce((s, f) => s + f.planned, 0);
   const plannedExpenses = financialMonthForecasts.filter(f => f.type === "expense").reduce((s, f) => s + f.planned, 0);
   const plan = { income: plannedIncome, expenses: plannedExpenses };
   const balance = realizedIncome - realizedExpenses;
-  const planDiff = plannedExpenses - committedExpenses;
+  const planDiff = plannedExpenses - realizedExpenses;
 
   const update = (patch) => setData(d => ({ ...d, ...patch }));
   const updateUser = (patch) => setData(d => ({ ...d, users: { ...d.users, [d.activeUser]: { ...d.users[d.activeUser], ...patch } } }));
@@ -476,7 +474,7 @@ export default function Home() {
 
         <div className="content">
           {syncError&&<div className="sync-warning">{syncError}</div>}
-          {page === "Visão geral" && <Dashboard {...{ data, user: {...user, plan, transactions: financialMonthTransactions}, installmentUser:user, balance, realizedIncome, realizedExpenses, committedExpenses, planDiff, savingsPercent, setModal, setPage }} />}
+          {page === "Visão geral" && <Dashboard {...{ data, user: {...user, plan, transactions: financialMonthTransactions}, installmentUser:user, balance, realizedIncome, realizedExpenses, planDiff, savingsPercent, setModal, setPage }} />}
           {page === "Planejamento" && <Planning {...{ data, setData, user, month: data.month, period: data.period, setModal }} />}
           {page === "Cotações" && <Quotes {...{ data, setData, setModal }} />}
           {page === "Lançamentos" && <Transactions user={user} setModal={setModal} setData={setData} activeUser={data.activeUser} />}
@@ -557,8 +555,8 @@ function FormSelect({ name, options, defaultValue, value, onChange, ariaLabel, c
   </div>;
 }
 
-function Dashboard({ data, user, installmentUser, balance, realizedIncome, realizedExpenses, committedExpenses, planDiff, savingsPercent, setModal, setPage }) {
-  const chartMax = Math.max(user.plan.expenses, committedExpenses, realizedExpenses, 1);
+function Dashboard({ data, user, installmentUser, balance, realizedIncome, realizedExpenses, planDiff, savingsPercent, setModal, setPage }) {
+  const chartMax = Math.max(user.plan.expenses, realizedExpenses, 1);
   const trackedInstallments=installmentSummaries(installmentUser,data.period);
   const monthSavings = (data.savings.movements||[]).filter(m=>itemMatchesPeriod(m,data.period,data.period)&&m.type==="entry").reduce((sum,m)=>sum+m.amount,0);
   const remainingGoal = Math.max((data.savings.goal||0)-data.savings.balance,0);
@@ -572,23 +570,22 @@ function Dashboard({ data, user, installmentUser, balance, realizedIncome, reali
     </div>
     <section className="stat-grid">
       <Stat label="Receitas" value={money(realizedIncome)} note={`de ${money(user.plan.income)} previstos`} icon={ArrowUpRight} tone="blue" />
-      <Stat label="Comprometido" value={money(committedExpenses)} note="obrigações assumidas no período" icon={ReceiptText} tone="gold" />
-      <Stat label="Pago" value={money(realizedExpenses)} note={`de ${money(user.plan.expenses)} planejados`} icon={Check} tone="coral" />
+      <Stat label="Despesas realizadas" value={money(realizedExpenses)} note={`de ${money(user.plan.expenses)} previstos`} icon={ArrowDownLeft} tone="coral" />
+      <Stat label="Saldo do mês" value={money(balance)} note="receitas menos despesas realizadas" icon={WalletCards} tone="gold" />
     </section>
     <section className="dashboard-grid">
       <div className="dashboard-column dashboard-main-column">
         <div className="panel spending-panel">
-          <div className="panel-head"><div><span>PLANEJADO X COMPROMETIDO X PAGO</span><h2>Ritmo de gastos</h2></div><button onClick={() => setPage("Planejamento")}>Ver planejamento</button></div>
+          <div className="panel-head"><div><span>PREVISTO X REALIZADO</span><h2>Ritmo de gastos</h2></div><button onClick={() => setPage("Planejamento")}>Ver planejamento</button></div>
           <div className="expense-bar-chart">
             <div className="chart-scale"><span>{money(chartMax)}</span><span>{money(chartMax/2)}</span><span>R$ 0</span></div>
             <div className="chart-columns">
-              <div><span className="chart-value">{money(user.plan.expenses)}</span><i className="planned-column" style={{height:`${user.plan.expenses/chartMax*100}%`}}/><b>Planejado</b></div>
-              <div><span className="chart-value">{money(committedExpenses)}</span><i className="committed-column" style={{height:`${committedExpenses/chartMax*100}%`}}/><b>Comprometido</b></div>
-              <div><span className="chart-value">{money(realizedExpenses)}</span><i className="actual-column" style={{height:`${realizedExpenses/chartMax*100}%`}}/><b>Pago</b></div>
+              <div><span className="chart-value">{money(user.plan.expenses)}</span><i className="planned-column" style={{height:`${user.plan.expenses/chartMax*100}%`}}/><b>Previsto</b></div>
+              <div><span className="chart-value">{money(realizedExpenses)}</span><i className="actual-column" style={{height:`${realizedExpenses/chartMax*100}%`}}/><b>Realizado</b></div>
             </div>
           </div>
           <div className="big-progress">
-            <div className="progress-message"><Sparkles size={18} /><div><b>{planDiff >= 0 ? `Ainda há ${money(planDiff)} livres no planejamento.` : `Atenção: ${money(Math.abs(planDiff))} comprometidos acima do plano.`}</b><span>{money(Math.max(committedExpenses-realizedExpenses,0))} ainda estão comprometidos e pendentes de pagamento.</span></div></div>
+            <div className="progress-message"><Sparkles size={18} /><div><b>{planDiff >= 0 ? `Você realizou ${money(planDiff)} a menos que o previsto.` : `Atenção: o realizado passou ${money(Math.abs(planDiff))} da previsão.`}</b><span>Comparação baseada somente nos valores efetivamente realizados no mês.</span></div></div>
           </div>
         </div>
         <div className="panel recent">
@@ -677,9 +674,7 @@ function Planning({ data, setData, user, setModal, month, period }) {
   const plannedExpenses = financialForecasts.filter(f => f.type === "expense").reduce((s,f)=>s+f.planned,0);
   const actualIncome = financialForecasts.filter(f => f.type === "income" && (forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="income"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
   const actualExpenses = financialForecasts.filter(f => f.type === "expense" && ((forecastIsAutomaticFixed(f)&&fixedExpensePaymentStatus(f)==="Pago")||(!forecastIsAutomaticFixed(f)&&forecastIsConfirmed(f)))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0);
-  const committedExpenses = financialForecasts.filter(f=>f.type==="expense"&&(forecastIsAutomaticFixed(f)||forecastIsConfirmed(f))).reduce((s,f)=>s+(forecastIsAutomaticFixed(f)?f.planned:(f.actual||0)),0) + unplanned.filter(t=>t.type==="expense"&&["Realizado","Pendente"].includes(t.status)).reduce((s,t)=>s+t.amount,0);
   const plannedTotal = plannedIncome - plannedExpenses;
-  const actualTotal = actualIncome - actualExpenses;
   const leftover = actualIncome - actualExpenses;
 
   const updateActual = (forecast, raw) => {
@@ -755,7 +750,7 @@ function Planning({ data, setData, user, setModal, month, period }) {
   });
 
   return <>
-    <PageTitle eyebrow="ORGANIZE ANTES DE GASTAR" title={`Planejamento de ${periodLabel(period)}`} subtitle="Sua previsão mensal em formato de planilha, separando valores comprometidos e pagos.">
+    <PageTitle eyebrow="ORGANIZE ANTES DE GASTAR" title={`Planejamento de ${periodLabel(period)}`} subtitle="Sua previsão mensal em formato de planilha, comparando valores previstos e realizados.">
       <div className="planning-title-actions">
         <button className="installment-header-button" onClick={()=>setModal("installment-tracker")} aria-label="Acompanhar despesas parceladas"><Grid2X2 size={15}/><span>Acompanhamento</span>{trackedInstallments.length>0&&<b>{trackedInstallments.length}</b>}</button>
         <button className="monthly-sheet-button" onClick={() => setModal("monthly-sheet")}><Grid2X2 size={17}/><span>Planilha do mês</span></button>
@@ -765,9 +760,7 @@ function Planning({ data, setData, user, setModal, month, period }) {
     <section className="planning-hero">
       <div><span>SALDO PREVISTO</span><strong>{money(plannedTotal)}</strong><small>receitas menos despesas</small></div>
       <div className="vertical-rule" />
-      <div><span>COMPROMETIDO</span><strong>{money(committedExpenses)}</strong><small>obrigações assumidas no período</small></div>
-      <div className="vertical-rule" />
-      <div><span>PAGO</span><strong>{money(actualExpenses)}</strong><small>valores efetivamente quitados</small></div>
+      <div><span>REALIZADO</span><strong>{money(actualExpenses)}</strong><small>despesas concluídas no período</small></div>
       <div className="vertical-rule" />
       <div className={leftover >= 0 ? "positive" : "negative"}><span>SOBROU</span><strong>{leftover < 0 ? "− " : ""}{money(Math.abs(leftover))}</strong><small>{leftover >= 0 ? "receitas menos despesas do mês" : "despesas acima das receitas"}</small></div>
     </section>
@@ -986,6 +979,10 @@ function HomeChecklist({data,setData,setModal,setPage}){
     form.reset();
   };
   const setStatus=(groupId,itemId,status)=>updateGroups(list=>list.map(group=>group.id===groupId?{...group,items:group.items.map(item=>item.id===itemId&&!item.savingsMovementId?{...item,status}:item)}:group));
+  const requestStatus=(group,item,status)=>{
+    if(status==="Comprado"&&!item.savingsMovementId){setModal(`home-purchase:${group.id}:${item.id}`);return;}
+    setStatus(group.id,item.id,status);
+  };
   const createQuote=(group,item)=>{
     const quoteId=Date.now();
     setData(d=>({...d,
@@ -1011,9 +1008,9 @@ function HomeChecklist({data,setData,setModal,setPage}){
       </div>
       {open&&<div className="home-group-content">
         <div className="home-items">{group.items.map(item=><div className={`home-item ${item.status==="Comprado"?"bought":""}`} key={item.id}>
-          <button className="home-check" disabled={Boolean(item.savingsMovementId)} aria-label={`${item.status==="Comprado"?"Desmarcar":"Marcar como comprado"} ${item.name}`} onClick={()=>setStatus(group.id,item.id,item.status==="Comprado"?"Pendente":"Comprado")}>{item.status==="Comprado"&&<Check size={15}/>}</button>
+          <button className="home-check" disabled={Boolean(item.savingsMovementId)} aria-label={`${item.status==="Comprado"?"Desmarcar":"Marcar como comprado"} ${item.name}`} onClick={()=>requestStatus(group,item,item.status==="Comprado"?"Pendente":"Comprado")}>{item.status==="Comprado"&&<Check size={15}/>}</button>
           <span><b>{item.name}</b><small>{item.status}{item.savingsMovementId?" • Pago pelo Cofrinho":""}</small></span>
-          {item.savingsMovementId?<span className="home-savings-badge"><PiggyBank size={13}/> Cofrinho</span>:<CustomSelect className={`home-status ${item.status==="Comprado"?"bought":item.status==="Em cotação"?"quoting":""}`} ariaLabel={`Status de ${item.name}`} value={item.status} onChange={status=>setStatus(group.id,item.id,status)} options={["Pendente","Em cotação","Comprado"].map(status=>({value:status,label:status}))}/>} 
+          {item.savingsMovementId?<span className="home-savings-badge"><PiggyBank size={13}/> Cofrinho</span>:<CustomSelect className={`home-status ${item.status==="Comprado"?"bought":item.status==="Em cotação"?"quoting":""}`} ariaLabel={`Status de ${item.name}`} value={item.status} onChange={status=>requestStatus(group,item,status)} options={["Pendente","Em cotação","Comprado"].map(status=>({value:status,label:status}))}/>} 
           {!item.quoteId&&item.status!=="Comprado"&&<button className="home-quote-button" aria-label={`Criar cotação para ${item.name}`} title="Criar cotação" onClick={()=>createQuote(group,item)}><ClipboardList size={15}/></button>}
           <button className="delete-button" disabled={Boolean(item.savingsMovementId)} title={item.savingsMovementId?"Exclua primeiro o lançamento do Cofrinho":"Excluir item"} aria-label={`Excluir item ${item.name}`} onClick={()=>removeItem(group.id,item.id)}><Trash2 size={15}/></button>
         </div>)}</div>
@@ -1235,6 +1232,13 @@ function Modal({ type, onClose, data, setData, user }) {
   const [phone, setPhone] = useState(formatPhone(personExisting?.whatsapp||""));
   const isQuote = type === "quote";
   const isHomeGroup = type === "home-group";
+  const isHomePurchase=type.startsWith("home-purchase:");
+  const homePurchaseParts=isHomePurchase?type.split(":"):[];
+  const homePurchaseGroup=isHomePurchase?(data.homeGroups||[]).find(group=>String(group.id)===homePurchaseParts[1]):null;
+  const homePurchaseItem=isHomePurchase?homePurchaseGroup?.items.find(item=>String(item.id)===homePurchaseParts[2]):null;
+  const homePurchaseOption=isHomePurchase?savingsHomeOptions(data).find(item=>String(item.groupId)===homePurchaseParts[1]&&String(item.itemId)===homePurchaseParts[2]):null;
+  const [homePurchaseUseSavings,setHomePurchaseUseSavings]=useState(true);
+  const [homePurchaseAmount,setHomePurchaseAmount]=useState(homePurchaseOption?.suggestedAmount?String(homePurchaseOption.suggestedAmount):"");
   const isWithdrawal = type === "savings-withdraw";
   const withdrawalHomeOptions=savingsHomeOptions(data);
   const [withdrawalHomeItemId,setWithdrawalHomeItemId]=useState(String(withdrawalHomeOptions[0]?.itemId||""));
@@ -1270,6 +1274,16 @@ function Modal({ type, onClose, data, setData, user }) {
       const id=+fd.get("goalId");
       setData(d=>{const goals=(d.savings.goals||[]).filter(g=>g.id!==id),next=goals[0]||null;return {...d,savings:{...d.savings,goals,activeGoalId:next?.id||null,goal:next?.amount||0,goalType:next?.type||"annual",goalMonths:next?.months||12}}});
     }
+    else if(isHomePurchase){
+      if(!homePurchaseGroup||!homePurchaseItem)return;
+      if(homePurchaseUseSavings){
+        const amount=+fd.get("homePurchaseAmount");
+        if(amount<=0||amount>data.savings.balance)return;
+        setData(d=>applySavingsHomePurchase(d,{id:Date.now(),groupId:homePurchaseGroup.id,itemId:homePurchaseItem.id,amount,reason:`Compra de ${homePurchaseItem.name}`,category:"Moradia",person:d.activeUser}));
+      } else {
+        setData(d=>({...d,homeGroups:(d.homeGroups||[]).map(group=>group.id===homePurchaseGroup.id?{...group,items:group.items.map(item=>item.id===homePurchaseItem.id?{...item,status:"Comprado"}:item)}:group)}));
+      }
+    }
     else if(isForecast){
       const total=+fd.get("planned"), personId=fd.get("person"), person=user.people.find(p=>String(p.id)===personId), cardId=+(fd.get("cardId")||0)||null, card=user.cards.find(c=>c.id===cardId);
       if(!person)return;
@@ -1304,13 +1318,14 @@ function Modal({ type, onClose, data, setData, user }) {
   };
   const detailCard = isCardDetails ? user.cards.find(c=>c.id===detailCardId) : null;
   return <div className="modal-backdrop" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><div className={`modal ${isCardView?"card-view-modal":""}`} style={isCardView?{"--detail-color":detailCard?.color||"#173f35"}:undefined}><button className="modal-close" onClick={onClose}><X/></button>
-    <span className="modal-kicker">{isAlertTemplate?"MENSAGEM PADRÃO":isEditAlert?"EDITAR ALERTA":isAlert?"NOVO ALERTA":isQuote?"NOVA COTAÇÃO":isHomeGroup?"NOVO GRUPO":isCardDetails?"DETALHES DO CARTÃO":isCardBalance?"SALDO DO BENEFÍCIO":isGoal?"NOVA META":isGoalDelete?"EXCLUIR META":isForecast?"NOVA PREVISÃO":isEditPerson?"EDITAR PESSOA":isPerson?"NOVA PESSOA":isWithdrawal?"RETIRADA DO COFRINHO":type==="transaction"?"NOVO LANÇAMENTO":type==="saving"?"CONTRIBUIÇÃO":type==="card"?"NOVO CARTÃO":"NOVA MOVIMENTAÇÃO"}</span>
-    <h2>{isAlertTemplate?"Personalizar mensagem do WhatsApp":isEditAlert?"Editar alerta de cobrança":isAlert?"Criar alerta de cobrança":isQuote?"Criar uma cotação":isHomeGroup?"Criar grupo para a casa":isCardDetails?(user.cards.find(c=>c.id===detailCardId)?.name||"Cartão"):isCardBalance?"Adicionar saldo do mês":isGoal?"Definir uma meta":isGoalDelete?"Escolha a meta que deseja excluir":isForecast?"Adicionar linha ao planejamento":isEditPerson?"Editar pessoa":isPerson?"Adicionar pessoa":isWithdrawal?"Remover saldo do cofrinho":type==="transaction"?"Registre uma movimentação":type==="saving"?"Adicionar ao cofrinho":type==="card"?"Adicionar cartão":"Movimentar cartão"}</h2>
+    <span className="modal-kicker">{isAlertTemplate?"MENSAGEM PADRÃO":isEditAlert?"EDITAR ALERTA":isAlert?"NOVO ALERTA":isQuote?"NOVA COTAÇÃO":isHomePurchase?"ITEM COMPRADO":isHomeGroup?"NOVO GRUPO":isCardDetails?"DETALHES DO CARTÃO":isCardBalance?"SALDO DO BENEFÍCIO":isGoal?"NOVA META":isGoalDelete?"EXCLUIR META":isForecast?"NOVA PREVISÃO":isEditPerson?"EDITAR PESSOA":isPerson?"NOVA PESSOA":isWithdrawal?"RETIRADA DO COFRINHO":type==="transaction"?"NOVO LANÇAMENTO":type==="saving"?"CONTRIBUIÇÃO":type==="card"?"NOVO CARTÃO":"NOVA MOVIMENTAÇÃO"}</span>
+    <h2>{isAlertTemplate?"Personalizar mensagem do WhatsApp":isEditAlert?"Editar alerta de cobrança":isAlert?"Criar alerta de cobrança":isQuote?"Criar uma cotação":isHomePurchase?`Finalizar compra de ${homePurchaseItem?.name||"item"}`:isHomeGroup?"Criar grupo para a casa":isCardDetails?(user.cards.find(c=>c.id===detailCardId)?.name||"Cartão"):isCardBalance?"Adicionar saldo do mês":isGoal?"Definir uma meta":isGoalDelete?"Escolha a meta que deseja excluir":isForecast?"Adicionar linha ao planejamento":isEditPerson?"Editar pessoa":isPerson?"Adicionar pessoa":isWithdrawal?"Remover saldo do cofrinho":type==="transaction"?"Registre uma movimentação":type==="saving"?"Adicionar ao cofrinho":type==="card"?"Adicionar cartão":"Movimentar cartão"}</h2>
     <form onSubmit={submit}>
       {isAlertTemplate&&<><label>Mensagem padrão<textarea required name="template" value={templateText} onChange={e=>setTemplateText(e.target.value)}/></label><p className="form-hint"><MessageCircle size={14}/> Use <b>{"{descricao}"}</b> e <b>{"{valor}"}</b> para preencher automaticamente cada cobrança.</p><div className="message-preview"><span>PRÉVIA</span><p>{alertMessageFromTemplate(templateText,"Exemplo de cobrança",125)}</p></div></>}
       {isAlert&&<><label>Título do alerta<input required name="title" value={alertTitle} onChange={e=>{const title=e.target.value;setAlertTitle(title);if(!alertMessageEdited)setAlertMessage(buildAlertMessage(title,alertAmount));}} placeholder="Ex.: Cobrar valor do cartão"/></label><div className="form-row"><label>Ativar alerta em<input required name="activationDate" type="date" defaultValue={alertExisting?.activationDate||localDateKey()}/></label><label>Valor da cobrança<input required name="alertAmount" type="number" min="0" step="0.01" value={alertAmount} onChange={e=>{const amount=e.target.value;setAlertAmount(amount);if(!alertMessageEdited)setAlertMessage(buildAlertMessage(alertTitle,amount));}} placeholder="0,00"/></label></div><div className="form-row"><label>Cartão <small>(opcional)</small><FormSelect name="cardId" ariaLabel="Cartão do alerta" defaultValue={alertExisting?.cardId||alertTransaction?.cardId||""} options={[{value:"",label:"Sem cartão"},...user.cards.map(c=>({value:String(c.id),label:`${c.name} • fecha dia ${c.closingDay||1}`}))]}/></label><label>Pessoa<FormSelect name="personId" ariaLabel="Pessoa do alerta" defaultValue={alertExisting?.personId||alertTransaction?.personId||""} options={[{value:"",label:"Selecione uma pessoa"},...user.people.map(p=>({value:String(p.id),label:p.name}))]}/></label></div><label>Texto da mensagem<textarea required name="message" value={alertMessage} onChange={e=>{setAlertMessage(e.target.value);setAlertMessageEdited(true);}}/></label>{alertTransaction&&<p className="form-hint"><ReceiptText size={14}/> Alerta conectado ao lançamento “{alertTransaction.title}”.</p>}{!user.people.length&&<p className="form-hint"><AlertTriangle size={14}/> Cadastre uma pessoa antes de criar o alerta.</p>}</>}
       {isQuote&&<><label>Assunto da cotação<input required name="subject" placeholder="Ex.: Móveis da casa"/></label><label>Itens iniciais da checklist <small>(um por linha)</small><textarea name="items" placeholder={"Sofá para a sala\nMesa de jantar\nRack para televisão"}/></label><p className="form-hint"><Link2 size={14}/> Depois de criar, você poderá anexar um link diferente a cada item.</p></>}
       {isHomeGroup&&<><label>Nome do grupo<input required name="groupName" placeholder="Ex.: Cozinha, Sala ou Quarto"/></label><p className="form-hint"><House size={14}/> Depois de criar o grupo, adicione os itens e acompanhe o status de cada compra.</p></>}
+      {isHomePurchase&&<><div className="home-purchase-summary"><House size={20}/><span><small>{homePurchaseGroup?.name}</small><b>{homePurchaseItem?.name}</b></span><strong>{money(data.savings.balance)}<small>no Cofrinho</small></strong></div><label className={`check home-purchase-check ${homePurchaseUseSavings?"checked":""}`}><input type="checkbox" name="useSavings" checked={homePurchaseUseSavings} onChange={event=>setHomePurchaseUseSavings(event.target.checked)}/><span><b>Gerar lançamento pelo Cofrinho</b><small>Debita somente do Cofrinho e não altera o saldo mensal</small></span></label>{homePurchaseUseSavings&&<label>Valor da compra<input required name="homePurchaseAmount" type="number" min="0.01" max={data.savings.balance} step="0.01" value={homePurchaseAmount} onChange={event=>setHomePurchaseAmount(event.target.value)} placeholder="0,00"/></label>}<p className="form-hint"><ReceiptText size={14}/>{homePurchaseUseSavings?"Será criado um lançamento neutro e o item ficará identificado como pago pelo Cofrinho.":"O item será marcado como comprado sem gerar movimentação financeira."}</p></>}
       {isCardDetails&&(()=>{const card=user.cards.find(c=>c.id===detailCardId),items=user.transactions.filter(t=>t.cardId===detailCardId),food=card?.cardType==="food"||card?.cardType==="benefit",debit=card?.cardType==="debit",spent=items.filter(t=>t.type==="expense"&&t.status==="Realizado").reduce((s,t)=>s+t.amount,0),monthLoaded=(card?.monthlyBalances||{})[data.period]||0;return <>{!debit&&<div className="detail-balance"><span>{food?"Saldo atual":"Limite disponível"}</span><b>{money(food?(card?.balance||0):Math.max((card?.limit||0)-(card?.spent||0),0))}</b><small>{food?`${money(monthLoaded)} adicionados em ${periodLabel(data.period)}`:`Fechamento dia ${card?.closingDay||1}`}</small></div>}{debit&&<div className="detail-balance"><span>TOTAL MOVIMENTADO NO DÉBITO</span><b>{money(spent)}</b><small>Sem controle de saldo ou limite</small></div>}{!isCardView&&<label>Cor de identificação<input name="color" type="color" defaultValue={card?.color||"#173f35"}/></label>}<div className="card-statement"><span>ÚLTIMAS MOVIMENTAÇÕES</span>{items.length?items.slice(0,5).map(t=><div key={t.id}><b>{t.title}</b><small>{t.date} • {t.category}{t.person?` • ${t.person}`:""}</small><strong className={t.type==="income"?"positive-value":"negative-value"}>{t.type==="income"?"+":"−"} {money(t.amount)}</strong></div>):<p>Nenhuma movimentação neste cartão.</p>}</div></>})()}
       {isCardBalance&&(()=>{const card=user.cards.find(c=>c.id===balanceCardId);return <><div className="withdraw-balance"><span>Saldo atual</span><b>{money(card?.balance||0)}</b></div><label>Saldo recebido em {data.month}<input required name="balanceAmount" type="number" min="0.01" step="0.01" placeholder="0,00"/></label><p className="form-hint"><CircleDollarSign size={14}/> O valor será somado ao saldo atual e os gastos continuarão sendo debitados automaticamente.</p></>})()}
       {isGoal&&<><label>Nome da meta<input required name="goalName" placeholder="Ex.: Reserva de emergência"/></label><fieldset className="goal-modal-options"><legend>Como será esta meta?</legend><div><button type="button" className={goalType==="annual"?"active":""} onClick={()=>setGoalType("annual")}><Target/><span><b>Meta anual</b><small>Distribuída em 12 meses</small></span></button><button type="button" className={goalType==="monthly"?"active":""} onClick={()=>setGoalType("monthly")}><CalendarDays/><span><b>Meta por período</b><small>Escolha os meses da meta</small></span></button></div></fieldset><label>Valor total da meta<div className="modal-money-input"><span>R$</span><input required name="goalAmount" type="number" min="0.01" step="0.01" placeholder="0,00"/></div></label>{goalType==="monthly"&&<div className="month-grid goal-month-grid"><span>Em quais meses esta meta será válida?</span><div>{months.map(m=><label className={goalMonths.includes(m)?"selected":""} key={m}><input type="checkbox" checked={goalMonths.includes(m)} onChange={()=>setGoalMonths(current=>current.includes(m)?current.filter(x=>x!==m):[...current,m])}/>{m.slice(0,3)}</label>)}</div><small>{goalMonths.length} {goalMonths.length===1?"mês selecionado":"meses selecionados"}</small></div>}<p className="form-hint"><Sparkles size={14}/> Após salvar, esta meta ficará bloqueada para edição.</p></>}
@@ -1322,8 +1337,9 @@ function Modal({ type, onClose, data, setData, user }) {
       {type==="saving"&&<label>Valor da contribuição<input required name="amount" type="number" step="0.01" placeholder="0,00"/></label>}
       {type==="card"&&<><label>Nome do cartão<input required name="name" placeholder="Ex.: Alimentação"/></label><div className="form-row"><label>Tipo<FormSelect name="cardType" ariaLabel="Tipo do cartão" value={cardType} onChange={setCardType} options={[{value:"debit",label:"Débito"},{value:"credit",label:"Crédito"},{value:"food",label:"Alimentação"}]}/></label><label>Cor<input name="color" type="color" defaultValue="#173f35"/></label></div><label>Últimos 4 dígitos<input required name="ending" maxLength="4" inputMode="numeric" placeholder="0000"/></label>{cardType==="credit"&&<div className="form-row"><label>Dia de fechamento<input required name="closingDay" type="number" min="1" max="31" defaultValue="20"/></label><label>Limite de crédito<input required name="limit" type="number" min="0" step="0.01" placeholder="0,00"/></label></div>}{cardType==="food"&&<label>Saldo<input required name="initialBalance" type="number" min="0" step="0.01" placeholder="0,00"/></label>}{cardType==="debit"&&<p className="form-hint"><CreditCard size={14}/> Cartões de débito registram movimentações, sem controle de saldo ou limite.</p>}</>}
       {isCardExpense&&<><div className="segmented"><button type="button" className={kind==="expense"?"active":""} onClick={()=>setKind("expense")}><ArrowDownLeft/> Débito</button><button type="button" className={kind==="income"?"active":""} onClick={()=>setKind("income")}><ArrowUpRight/> Crédito</button></div><label>Descrição<input required name="title" placeholder="Ex.: Jantar"/></label><div className="form-row"><label>Valor<input required name="amount" type="number" step="0.01"/></label><label>Categoria<FormSelect name="category" ariaLabel="Categoria da movimentação" defaultValue="Alimentação" options={["Alimentação","Compras","Transporte","Lazer","Outros"].map(label=>({value:label,label}))}/></label></div><label>Pessoa vinculada<FormSelect name="personId" ariaLabel="Pessoa vinculada à movimentação" defaultValue="" options={[{value:"",label:"Titular da conta"},...user.people.map(p=>({value:String(p.id),label:p.name}))]}/></label></>}
-      <div className="modal-actions">{isCardView?<button type="button" className="primary" onClick={onClose}>Fechar</button>:<><button type="button" className="ghost" onClick={onClose}>Cancelar</button><button disabled={isWithdrawal&&!withdrawalHomeOptions.length} className={isGoalDelete?"danger-button":"primary"} type="submit">{isAlertTemplate?"Salvar mensagem":isEditAlert?"Salvar alterações":isAlert?"Criar alerta":isQuote?"Criar cotação":isHomeGroup?"Criar grupo":isCardDetails?"Salvar cor":isCardBalance?"Adicionar saldo":isGoal?"Salvar meta":isGoalDelete?"Excluir meta":isForecast ? "Adicionar previsão" : isEditPerson?"Salvar alterações":isPerson ? "Salvar pessoa" : isWithdrawal ? "Confirmar compra" : "Salvar lançamento"}</button></>}</div>
+      <div className="modal-actions">{isCardView?<button type="button" className="primary" onClick={onClose}>Fechar</button>:<><button type="button" className="ghost" onClick={onClose}>Cancelar</button><button disabled={isWithdrawal&&!withdrawalHomeOptions.length} className={isGoalDelete?"danger-button":"primary"} type="submit">{isAlertTemplate?"Salvar mensagem":isEditAlert?"Salvar alterações":isAlert?"Criar alerta":isQuote?"Criar cotação":isHomePurchase?"Confirmar compra":isHomeGroup?"Criar grupo":isCardDetails?"Salvar cor":isCardBalance?"Adicionar saldo":isGoal?"Salvar meta":isGoalDelete?"Excluir meta":isForecast ? "Adicionar previsão" : isEditPerson?"Salvar alterações":isPerson ? "Salvar pessoa" : isWithdrawal ? "Confirmar compra" : "Salvar lançamento"}</button></>}</div>
     </form>
   </div></div>;
 }
+
 
